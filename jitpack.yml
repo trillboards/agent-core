@@ -1,0 +1,4 @@
+jdk:
+  - openjdk17
+install:
+  - ANDROID_HOME=$ANDROID_HOME ./gradlew clean assembleRelease publishToMavenLocal

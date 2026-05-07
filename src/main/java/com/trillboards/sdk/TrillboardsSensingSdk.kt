@@ -1,0 +1,279 @@
+package com.trillboards.sdk
+
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.trillboards.ctv.core.AgentConfig
+import com.trillboards.ctv.core.DeviceIdentity
+import com.trillboards.ctv.core.audience.AudienceSensingService
+import com.trillboards.ctv.core.audience.SensingConfig as AudienceSensingConfig
+import com.trillboards.ctv.core.net.ApiClient
+import com.trillboards.ctv.core.socket.AgentSocketManager
+import org.json.JSONObject
+
+/**
+ * Public partner-facing entry point for the Trillboards Sensing SDK.
+ *
+ * Three-line integration:
+ *
+ * ```
+ * TrillboardsSensingSdk.start(
+ *     context = applicationContext,
+ *     partnerApiKey = "tb_ctv_xxx"
+ * )
+ * ```
+ *
+ * Scope is intentionally narrow: this is the **sensing-only** entry point.
+ * Ad serving (VAST, IMA, programmatic events, proof-of-play) lives on the
+ * five HTTP endpoints documented in
+ * `docs/integrations/partner-native-ima-sdk.md` Sections 1–11. Partners drive
+ * those endpoints from their existing IMA SDK setup; sensing runs alongside
+ * over the same `partnerApiKey` and emits aggregate signals (face counts,
+ * age bins, audio classifications, dwell estimates, BLE/WiFi co-viewing) to
+ * the Trillboards backend.
+ *
+ * What `start()` actually wires up:
+ *
+ * 1. Builds an [AgentConfig] with partner-friendly defaults — no overlay
+ *    intent action exposure, no shared-prefs collisions with partner code.
+ * 2. Creates an [ApiClient] that authenticates every emit with the
+ *    `partnerApiKey` (passed via the `X-Device-Token` /
+ *    `X-Trillboard-Device-Token` headers).
+ * 3. Connects an [AgentSocketManager] for real-time signal emission.
+ * 4. Starts an [AudienceSensingService] bound to `ProcessLifecycleOwner` so
+ *    CameraX gets a real lifecycle without forcing partners to declare a
+ *    foreground Service.
+ *
+ * Speech recognition (Moonshine ASR via sherpa-onnx) is opt-in: agent-core
+ * marks sherpa-onnx as `compileOnly`, so partners who don't bundle the
+ * `sherpa-onnx-1.12.26.aar` AAR + `moonshine-tiny/` model assets get a
+ * clean degrade path — face / audio / BLE / WiFi sensing runs unaffected.
+ * See `partner-native-ima-sdk.md` Section 12.5b for the BYO sherpa-onnx
+ * instructions.
+ */
+object TrillboardsSensingSdk {
+    private const val TAG = "TrillboardsSensingSdk"
+    private const val SDK_PREFS_NAME = "trillboards_sdk"
+    private const val OVERLAY_REFRESH_ACTION = "com.trillboards.sdk.OVERLAY_REFRESH"
+    private const val OVERLAY_BLACKOUT_ACTION = "com.trillboards.sdk.OVERLAY_BLACKOUT"
+
+    @Volatile private var apiClient: ApiClient? = null
+    @Volatile private var socketManager: AgentSocketManager? = null
+    @Volatile private var audienceSensing: AudienceSensingService? = null
+    @Volatile private var started: Boolean = false
+
+    /**
+     * Start the Sensing SDK. Idempotent — calling twice is a no-op.
+     *
+     * @param context Any [Context] (Application or Activity). The SDK
+     *   immediately calls `applicationContext` so the lifecycle is bound to
+     *   the process, not the caller.
+     * @param partnerApiKey The API key Trillboards issues you. The same key
+     *   you use for the heartbeat / ads endpoints in
+     *   `partner-native-ima-sdk.md` Sections 2–7. The SDK passes this as the
+     *   device token on every backend emit.
+     * @param config Optional [SensingSdkConfig] overrides. Defaults match
+     *   production tablets at typical retail mounting distances.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun start(
+        context: Context,
+        partnerApiKey: String,
+        config: SensingSdkConfig = SensingSdkConfig()
+    ) {
+        synchronized(this) {
+            if (started) {
+                Log.w(TAG, "TrillboardsSensingSdk.start() called twice — ignoring second call")
+                return
+            }
+
+            require(partnerApiKey.isNotBlank()) {
+                "TrillboardsSensingSdk.start: partnerApiKey must not be blank"
+            }
+
+            val appContext = context.applicationContext
+            val fingerprint = DeviceIdentity.stableFingerprint(appContext, SDK_PREFS_NAME)
+
+            Log.i(TAG, "Starting TrillboardsSensingSdk (fingerprint=${fingerprint.take(12)}…)")
+
+            val agentConfig = AgentConfig(
+                apiBaseUrl = config.apiBaseUrl,
+                socketUrl = config.socketUrl,
+                heartbeatIntervalMs = config.heartbeatIntervalMs,
+                sharedPrefsName = SDK_PREFS_NAME,
+                overlayRefreshAction = OVERLAY_REFRESH_ACTION,
+                overlayBlackoutAction = OVERLAY_BLACKOUT_ACTION
+            )
+
+            // ApiClient routes the partnerApiKey through deviceTokenProvider so
+            // every emit (heartbeat, audience-metrics, screenshot-upload-url,
+            // etc.) carries `X-Device-Token: tb_ctv_…` automatically.
+            val client = ApiClient(agentConfig) { partnerApiKey }
+            apiClient = client
+
+            // Real-time signal channel. Sensing emits Socket.io events
+            // (audienceSignals, audienceDemographics, deviceCapabilities) over
+            // this connection — the partner does not need to subscribe; the
+            // backend consumes them for the audience-attention flywheel.
+            val socket = AgentSocketManager(agentConfig)
+            if (config.connectSocket) {
+                socket.connect(
+                    fingerprint = fingerprint,
+                    listener = NoopSocketListener,
+                    deviceToken = partnerApiKey
+                )
+            }
+            socketManager = socket
+
+            val sensing = AudienceSensingService(
+                context = appContext,
+                fingerprint = fingerprint,
+                socketManager = socket,
+                apiBaseUrl = config.apiBaseUrl,
+                // Partner SDK consumers carry their device-token-equivalent as partnerApiKey
+                // (line 124 above passes the same value to socket.connect); FrameCaptureManager
+                // routes it through as X-Device-Token on the /v2/earner/audience-analyze POST.
+                deviceTokenProvider = { partnerApiKey }
+            )
+
+            if (config.sensingEnabled) {
+                val audienceConfig = AudienceSensingConfig(
+                    enableFaceDetection = config.faceDetectionEnabled,
+                    enableAudioClassification = config.audioClassificationEnabled,
+                    enableSpeechIntelligence = config.speechIntelligenceEnabled,
+                    enableDemographicsCapture = config.demographicsCaptureEnabled,
+                    enableEmotionalEngagement = config.emotionalEngagementEnabled
+                )
+
+                // ProcessLifecycleOwner survives for the entire app process —
+                // CameraX bindToLifecycle() will keep the camera open until the
+                // app is killed. Partners who want a tighter scope can call
+                // stop() on app foreground/background transitions.
+                sensing.start(ProcessLifecycleOwner.get(), audienceConfig)
+            } else {
+                Log.i(TAG, "sensingEnabled=false — SDK initialized but no sensors started")
+            }
+
+            audienceSensing = sensing
+            started = true
+
+            Log.i(TAG, "TrillboardsSensingSdk started successfully")
+        }
+    }
+
+    /**
+     * Stop the Sensing SDK. Releases camera, audio, and Socket.io resources.
+     * Safe to call from `Application.onTerminate()` or anywhere the partner
+     * decides to wind down audience sensing.
+     *
+     * The `context` parameter is reserved for forward compatibility (e.g.,
+     * unregistering broadcast receivers in a future release) — it is not
+     * read in this version. Callers should still pass the same Context
+     * they used in [start].
+     */
+    @JvmStatic
+    fun stop(@Suppress("UNUSED_PARAMETER") context: Context) {
+        synchronized(this) {
+            if (!started) {
+                Log.w(TAG, "TrillboardsSensingSdk.stop() called before start() — ignoring")
+                return
+            }
+
+            Log.i(TAG, "Stopping TrillboardsSensingSdk")
+
+            audienceSensing?.stop()
+            socketManager?.disconnect()
+
+            audienceSensing = null
+            socketManager = null
+            apiClient = null
+            started = false
+
+            Log.i(TAG, "TrillboardsSensingSdk stopped")
+        }
+    }
+
+    /**
+     * Returns true after [start] has run successfully.
+     * Test / diagnostic helper — partners typically don't need to call this.
+     */
+    @JvmStatic
+    fun isStarted(): Boolean = started
+
+    /**
+     * Reset internal state — used by unit tests to rerun start() with a
+     * fresh fixture. Not part of the public partner API; visible to allow
+     * the test class in `src/test/` to exercise the lifecycle without a
+     * real `Context`.
+     */
+    internal fun resetForTesting() {
+        synchronized(this) {
+            audienceSensing = null
+            socketManager = null
+            apiClient = null
+            started = false
+        }
+    }
+
+    private object NoopSocketListener : AgentSocketManager.Listener {
+        override fun onConnect(socketId: String?) {
+            Log.d(TAG, "Socket connected: socketId=$socketId")
+        }
+
+        override fun onDisconnect() {
+            Log.d(TAG, "Socket disconnected")
+        }
+
+        override fun onError(args: Array<Any?>) {
+            // Socket errors are non-fatal; ApiClient HTTP path keeps emitting.
+            Log.w(TAG, "Socket error: ${args.firstOrNull()}")
+        }
+
+        override fun onPrivateMessage(payload: JSONObject) {
+            // Partners on this SDK don't receive private messages; ignore.
+        }
+
+        override fun onDeviceCommand(payload: JSONObject) {
+            // MDM commands (restart / reboot / kiosk-mode flips) belong to the
+            // first-party Trillboards agent. Partners receive them on their
+            // own ad-serving control plane (Sections 1–11); ignore here.
+            Log.d(TAG, "Ignoring device command in sensing-only SDK: ${payload.optString("command_type")}")
+        }
+    }
+}
+
+/**
+ * Public configuration for [TrillboardsSensingSdk]. Every field has a
+ * production-ready default; partners typically need to override only
+ * `apiBaseUrl`/`socketUrl` for non-prod environments.
+ */
+data class SensingSdkConfig(
+    val apiBaseUrl: String = "https://api.trillboards.com",
+    val socketUrl: String = "https://chat.trillboards.com",
+    val heartbeatIntervalMs: Long = 30_000L,
+    val sensingEnabled: Boolean = true,
+    val faceDetectionEnabled: Boolean = true,
+    val audioClassificationEnabled: Boolean = true,
+    /**
+     * Speech intelligence requires the `sherpa-onnx-1.12.26.aar` AAR plus
+     * the `moonshine-tiny/` model assets. agent-core ships sherpa-onnx as
+     * `compileOnly` (the AAR is not on Maven Central), so the runtime
+     * guard in [com.trillboards.ctv.core.audience.AudienceSensingService]
+     * checks for the `moonshine-tiny/tokens.txt` asset before any
+     * sherpa-onnx class is loaded. Default `true` so partners who DO
+     * bundle the model see speech work; partners who don't are silently
+     * skipped.
+     */
+    val speechIntelligenceEnabled: Boolean = true,
+    val demographicsCaptureEnabled: Boolean = true,
+    val emotionalEngagementEnabled: Boolean = true,
+    /**
+     * Disable `connectSocket` if you only want HTTP-side sensing emits
+     * (heartbeat, audience-metrics) and prefer not to maintain a long-lived
+     * Socket.io connection. The on-device sensing pipeline still runs;
+     * realtime emits queue locally and are dropped if the socket isn't
+     * connected.
+     */
+    val connectSocket: Boolean = true
+)

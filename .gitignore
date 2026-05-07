@@ -1,0 +1,17 @@
+# Gradle build outputs
+build/
+.gradle/
+*.iml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Generated artifacts
+*.class
+*.jar
+out/
