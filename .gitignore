@@ -13,5 +13,6 @@ build/
 
 # Generated artifacts
 *.class
-*.jar
 out/
+# Note: gradle/wrapper/gradle-wrapper.jar is intentionally tracked so JitPack
+# and downstream consumers can run ./gradlew without needing Gradle pre-installed.
