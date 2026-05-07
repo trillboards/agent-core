@@ -115,11 +115,16 @@ publishing {
 dependencies {
     // Multi-protocol device discovery — Phase 1 of the Rust-backed rewrite.
     // The Rust `mdns-sd` core (compiled to per-ABI .so via the rust-android
-    // gradle plugin in :discovery-core) replaces the legacy NsdManager-driven
-    // path that lived in this module. The local `MdnsDiscovery.kt` shim under
-    // `com.trillboards.ctv.core.identity` keeps the legacy data-class names so
-    // `HeartbeatPayload` / `ApiClient` continue building unchanged.
-    implementation(project(":discovery-core"))
+    // gradle plugin) is shipped as a pre-built AAR at `libs/discovery-core-1.0.0.aar`.
+    //
+    // Marked `compileOnly` (mirroring the sherpa-onnx pattern below) so the
+    // published agent-core POM does NOT declare a runtime dep on a flatDir-only
+    // artifact. Partners who want Rust-backed mDNS drop the .aar into their
+    // own libs/ + add `flatDir { dirs("libs") }` to their settings.gradle.kts;
+    // partners who skip it use Android's NsdManager (the legacy path) and the
+    // `MdnsDiscovery` shim falls back gracefully via reflection at first
+    // adapter resolution.
+    compileOnly("trillboards-flatdir:discovery-core:1.0.0@aar")
 
     // AndroidX
     implementation("androidx.core:core-ktx:1.10.1")
