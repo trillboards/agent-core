@@ -304,7 +304,14 @@ object SensingConfig {
         }
     }
 
-    // ── GazeTrackingProcessor ───────────────────────────────────────────────
+    // ── FaceLandmarker gaze + ML Kit head-pose envelope ─────────────────────
+    // Used by AudienceAnalyzer.processEmotionalEngagementZeroAlloc (yaw/pitch
+    // engagement gate), HeuristicEmotionalEngagementEstimator (fallback when
+    // FaceLandmarker is unavailable), and FaceLandmarkerProcessor consumers
+    // for stability/region scoring. The legacy GazeTrackingProcessor that
+    // owned these magic numbers was deleted in Phase 3; the data class lives
+    // on because the same numeric thresholds describe the engagement
+    // envelope independent of which processor produces the gaze signal.
 
     data class GazeConfig(
         val headYawThreshold: Float = 20f,
@@ -454,7 +461,12 @@ object SensingConfig {
         }
     }
 
-    // ── EmotionClassificationProcessor ──────────────────────────────────────
+    // ── ML Kit smile-probability heuristic (HeuristicEmotionalEngagementEstimator) ──
+    // Consumed by HeuristicEmotionalEngagementEstimator's fallback path when
+    // FaceLandmarker is unavailable. The legacy EmotionClassificationProcessor
+    // that owned these thresholds (FER+ TFLite path) was deleted in Phase 3;
+    // the data class survives because the same thresholds describe the smile-
+    // probability → emotion mapping for the ML Kit-only fallback estimator.
 
     data class EmotionConfig(
         val minConfidence: Float = 0.3f,
@@ -580,7 +592,7 @@ object SensingConfig {
         }
     }
 
-    // ── InsightExtractor ────────────────────────────────────────────────────
+    // ── InsightConfig (legacy keyword-extraction tuning — InsightExtractor deleted in PR δ) ──
 
     data class InsightConfig(
         val baselineConfidence: Float = 0.2f,
@@ -833,7 +845,37 @@ object SensingConfig {
         val hpCutoffSpeech: Int = 200,
         val hpCutoffAmbient: Int = 150,
         // Low-pass filter for music noise (removes harmonics above this Hz)
-        val lpCutoffMusic: Int = 3000
+        val lpCutoffMusic: Int = 3000,
+        // ── On-device LLM extractor (PR L3+) ─────────────────────────────────
+        /**
+         * Master gate for [OnDeviceLlmInsightExtractor].
+         * Default false — production impact zero until PR L5 flips this via SSM.
+         * Remote-pushable via sensing_config_update { speech: { useLlmExtractor: true } }.
+         */
+        val useLlmExtractor: Boolean = false,
+        /**
+         * Model ID used to resolve the fine-tuned LiteRT-LM artifact.
+         * Must match a row in sensing_model_registry.
+         */
+        val llmExtractorModelId: String = "functiongemma_270m",
+        /**
+         * Per-inference timeout in milliseconds.
+         * FunctionGemma 270M CPU p95 is ~1.6 s; 2 s gives safe headroom.
+         * Kept in SensingConfig for remote-tunability without an APK ship.
+         */
+        val llmExtractorTimeoutMs: Long = 2000L,
+        /**
+         * Minimum transcript length (chars) before the LLM is invoked.
+         * Transcripts shorter than this fall through to the legacy race.
+         * Matches [OnDeviceLlmInsightExtractor.MIN_TRANSCRIPT_CHARS].
+         */
+        val llmExtractorMinTranscriptChars: Int = 25,
+        /**
+         * Shadow mode: run LLM in parallel with legacy race and emit a diff.
+         * Used by PR L4 to drive the 3-day soak before L5 cutover.
+         * Default false — not yet active in L3.
+         */
+        val shadowLlmExtractor: Boolean = false
     ) {
         fun mergeWith(json: JSONObject?): SpeechProcessingConfig {
             if (json == null) return this
@@ -844,7 +886,113 @@ object SensingConfig {
                 hpCutoffCrowd = json.optInt("hpCutoffCrowd", hpCutoffCrowd),
                 hpCutoffSpeech = json.optInt("hpCutoffSpeech", hpCutoffSpeech),
                 hpCutoffAmbient = json.optInt("hpCutoffAmbient", hpCutoffAmbient),
-                lpCutoffMusic = json.optInt("lpCutoffMusic", lpCutoffMusic)
+                lpCutoffMusic = json.optInt("lpCutoffMusic", lpCutoffMusic),
+                useLlmExtractor = if (json.has("useLlmExtractor")) json.optBoolean("useLlmExtractor", useLlmExtractor) else useLlmExtractor,
+                llmExtractorModelId = json.optString("llmExtractorModelId", llmExtractorModelId).ifBlank { llmExtractorModelId },
+                llmExtractorTimeoutMs = if (json.has("llmExtractorTimeoutMs")) json.optLong("llmExtractorTimeoutMs", llmExtractorTimeoutMs) else llmExtractorTimeoutMs,
+                llmExtractorMinTranscriptChars = json.optInt("llmExtractorMinTranscriptChars", llmExtractorMinTranscriptChars),
+                shadowLlmExtractor = if (json.has("shadowLlmExtractor")) json.optBoolean("shadowLlmExtractor", shadowLlmExtractor) else shadowLlmExtractor
+            )
+        }
+    }
+
+    // ── VLM Activation Policy ──────────────────────────────────────────────
+    //
+    // All numeric thresholds for VlmActivationPolicy.decide() live here so
+    // operators can A/B-test or hotfix via remote config without an APK ship.
+    //
+    // Defaults are recalibrated from empirical on-device RSS measurements
+    // (Galaxy Tab S11 / SM-X730, Dimensity 9400, 2026-05-27 de-risk session):
+    //
+    //   Gemma 4 E2B (declared 2580 MB): actual peak RSS = 1.65 GB
+    //   → measured multiplier = 1.65 / 2.58 = 0.64
+    //   → liteRtRuntimeMultiplier = 0.75 (0.64 + 0.11 safety margin)
+    //
+    //   minAvailableHeadroomMb = 768 (vs old 1536): old value was paired with
+    //   multiplier=1.5 and still left 5.4 GB total required on a 4 GB device.
+    //   768 MB covers the CameraX + WebView resident set on a premium tablet.
+    //
+    // New math: gemma_4_e2b needs ⌈2580 × 0.75⌉ + 768 = 2703 MB available.
+    // Galaxy Tab S11 (3.97 GB free) passes. Tab A9 (≤2.5 GB free) still fails
+    // — correct; that tier uses efficiency-path models, not Gemma E2B.
+    //
+    // defaultModelSizeMb: fallback sizes used only when modelFileSizeMb is
+    // absent from VlmActivationInput. The canonical source of truth is
+    // sensing_model_registry.model_size_mb (served via profile push). Pulling
+    // model_size_mb from the registry at activate-time is a follow-up (Phase
+    // 6 PR C) once the edge-side registry-read helper exists; until then these
+    // fallbacks cover the two shipped gemma variants.
+
+    data class VlmActivationConfig(
+        /**
+         * Multiplier applied to declared model file size to estimate peak RSS.
+         *
+         * Empirical: Gemma 4 E2B peak RSS 1.65 GB / 2.58 GB declared = 0.64
+         * multiplier on Galaxy Tab S11. +0.11 safety margin → 0.75.
+         * Prior value was 1.5 (2.3× too conservative); kept VLM permanently
+         * blocked on flagship S11 despite 3.97 GB available RAM.
+         */
+        val liteRtRuntimeMultiplier: Float = 0.75f,
+
+        /**
+         * Minimum free RAM (MB) that must remain after the estimated model
+         * footprint is reserved.
+         *
+         * 768 MB covers CameraX + WebView + system services resident set on a
+         * premium Android tablet. Prior value was 1536 MB (paired with the
+         * over-conservative 1.5× multiplier).
+         */
+        val minAvailableHeadroomMb: Int = 768,
+
+        /**
+         * Floor for total device RAM (MB). Devices below this never run VLM
+         * regardless of available headroom. Default 2048 MB retains the
+         * original gate — no regression for budget devices.
+         */
+        val minDeviceRamMb: Int = 2048,
+
+        /**
+         * Maximum native heap (MB) already in use before VLM is allowed.
+         * If nativeHeapMb >= this value the decision is "native_heap_hot".
+         * 1024 MB retains the original value; no empirical evidence to reduce
+         * it further without live heap profiles across device tiers.
+         */
+        val maxNativeHeapBeforeVlmMb: Int = 1024,
+
+        /**
+         * Fallback model-size map (MB) used when VlmActivationInput.modelFileSizeMb
+         * is null. Canonical source is sensing_model_registry.model_size_mb
+         * pushed via profile; these values match the current registry entries
+         * and are kept in sync manually until Phase 6 PR C wires the edge-side
+         * registry-read helper.
+         */
+        val defaultModelSizeMb: Map<String, Int> = mapOf(
+            "gemma_4_e2b" to 2580,
+            "functiongemma_270m" to 288
+        )
+    ) {
+        fun mergeWith(json: JSONObject?): VlmActivationConfig {
+            if (json == null) return this
+            val mergedMap: Map<String, Int> = run {
+                val mapJson = json.optJSONObject("defaultModelSizeMb")
+                if (mapJson == null) {
+                    defaultModelSizeMb
+                } else {
+                    val result = defaultModelSizeMb.toMutableMap()
+                    val keys = mapJson.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        result[k] = mapJson.optInt(k, defaultModelSizeMb[k] ?: 0)
+                    }
+                    result
+                }
+            }
+            return copy(
+                liteRtRuntimeMultiplier = json.optDouble("liteRtRuntimeMultiplier", liteRtRuntimeMultiplier.toDouble()).toFloat(),
+                minAvailableHeadroomMb = json.optInt("minAvailableHeadroomMb", minAvailableHeadroomMb),
+                minDeviceRamMb = json.optInt("minDeviceRamMb", minDeviceRamMb),
+                maxNativeHeapBeforeVlmMb = json.optInt("maxNativeHeapBeforeVlmMb", maxNativeHeapBeforeVlmMb),
+                defaultModelSizeMb = mergedMap
             )
         }
     }
@@ -852,6 +1000,7 @@ object SensingConfig {
     // ── VLM Inference / Engine ─────────────────────────────────────────────
 
     data class VlmConfig(
+        val activation: VlmActivationConfig = VlmActivationConfig(),
         val defaultSamplingIntervalMs: Long = 5_000L,
         val defaultInferenceTimeoutMs: Long = 45_000L,
         val samplingIntervalMinMs: Long = 1_000L,
@@ -893,6 +1042,7 @@ object SensingConfig {
         fun mergeWith(json: JSONObject?): VlmConfig {
             if (json == null) return this
             return copy(
+                activation = activation.mergeWith(json.optJSONObject("activation")),
                 defaultSamplingIntervalMs = json.optLong("defaultSamplingIntervalMs", defaultSamplingIntervalMs),
                 defaultInferenceTimeoutMs = json.optLong("defaultInferenceTimeoutMs", defaultInferenceTimeoutMs),
                 samplingIntervalMinMs = json.optLong("samplingIntervalMinMs", samplingIntervalMinMs),

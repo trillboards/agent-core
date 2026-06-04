@@ -179,7 +179,14 @@ class ObjectDetectionProcessor(
      * Run object detection on a camera frame.
      * Returns detected objects filtered by target classes and confidence threshold.
      *
-     * @param bitmap The camera frame in-memory bitmap.
+     * IMPORTANT: MediaPipe's `BitmapImageContainer.close()` (called via
+     * `mpImage.close()`) calls `recycle()` on the source bitmap. Passing the
+     * caller's bitmap directly would recycle AudienceAnalyzer's pre-allocated
+     * zero-alloc sharedBitmap, causing per-frame buffer reinit (~24×/sec).
+     * Fix mirrors PersonDetectionProcessor: pass a defensive copy to MediaPipe;
+     * recycle the copy in finally; the caller's bitmap stays alive.
+     *
+     * @param bitmap The camera frame in-memory bitmap (NOT recycled by this call).
      * @return DetectionResult with all detected objects and aggregated counts.
      */
     @Synchronized
@@ -191,11 +198,30 @@ class ObjectDetectionProcessor(
         }
 
         return try {
-            val mpImage = BitmapImageBuilder(bitmap).build()
+            val frameCopy = try {
+                bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to copy bitmap for object detection: ${e.message}")
+                return DetectionResult(emptyList(), emptyMap(), 0, 0, System.currentTimeMillis() - startMs)
+            }
+
             val result = try {
-                objectDetector?.detect(mpImage)
+                val mpImage = BitmapImageBuilder(frameCopy).build()
+                try {
+                    objectDetector?.detect(mpImage)
+                } finally {
+                    // mpImage.close() calls BitmapImageContainer.close() which
+                    // calls frameCopy.recycle(). The shared bitmap is unaffected
+                    // because we passed a copy.
+                    mpImage.close()
+                }
             } finally {
-                mpImage.close()
+                // Defensive: if MediaPipe's BitmapImageContainer ever stops
+                // recycling on close (API change), recycle the throwaway here
+                // so we don't leak the copy per call.
+                if (!frameCopy.isRecycled) {
+                    frameCopy.recycle()
+                }
             }
 
             val detections = parseDetections(result)

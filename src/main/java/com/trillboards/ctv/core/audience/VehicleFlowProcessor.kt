@@ -118,20 +118,22 @@ class VehicleFlowProcessor {
 
     /**
      * Convert metrics to JSON for the audience signal payload.
+     * Keys use registry-canonical snake_case so chipPersistence.sanitizeFieldKey
+     * is idempotent on canonical input.
      */
     fun toJson(metrics: FlowMetrics): JSONObject {
         return JSONObject().apply {
-            put("currentVehicleCount", metrics.currentVehicleCount)
-            put("avgVehicleCount", metrics.avgVehicleCount)
-            put("peakVehicleCount", metrics.peakVehicleCount)
-            put("fillRateEstimate", metrics.fillRateEstimate)
+            put("vehicle_count", metrics.currentVehicleCount)
+            put("avg_vehicle_count", metrics.avgVehicleCount)
+            put("peak_vehicle_count", metrics.peakVehicleCount)
+            put("fill_rate_estimate", metrics.fillRateEstimate)
             put("trend", metrics.trend)
 
             val typesJson = JSONObject()
             metrics.vehicleTypes.forEach { (type, count) ->
                 typesJson.put(type, count)
             }
-            put("vehicleTypes", typesJson)
+            put("vehicle_types", typesJson)
         }
     }
 

@@ -2,7 +2,6 @@ package com.trillboards.ctv.core.net
 
 import android.util.Log
 import com.trillboards.ctv.core.AgentConfig
-import com.trillboards.ctv.core.audience.AudienceMetricsPayload
 import com.trillboards.ctv.core.audience.ClassificationResult
 import com.trillboards.ctv.core.audience.ClassificationSource
 import com.trillboards.ctv.core.audience.IntentType
@@ -148,6 +147,14 @@ class ApiClient(
                         put("signal_dbm", network.signalStrengthDbm)
                         put("frequency_mhz", network.frequencyMhz)
                         network.channelWidthMhz?.let { put("channel_width_mhz", it) }
+                        // ── Venue-insights PR 8 (Cut E.4) — WiFi enrichment ──
+                        // Wire keys are snake_case per existing heartbeat convention.
+                        // Empty / default values still serialize so server-side gets
+                        // a consistent shape (matches the existing default-everywhere
+                        // pattern used by channel_sounding / auracast columns).
+                        put("capabilities", network.capabilities)
+                        put("is_80211mc_responder", network.is80211mcResponder)
+                        network.vendorOui2Byte?.let { put("vendor_oui_2byte", it) }
                     })
                 }
             })
@@ -184,6 +191,13 @@ class ApiClient(
                         d.ibeaconUuid?.let { put("ibeacon_uuid", it) }
                         d.ibeaconMajor?.let { put("ibeacon_major", it) }
                         d.ibeaconMinor?.let { put("ibeacon_minor", it) }
+                        // Venue-insights PR 7 (E.2/E.3): address type + paired
+                        // state captured per-device from BluetoothDevice. snake_case
+                        // on the wire to match the server-side normalizer
+                        // (SignalIngestService.normalize maps `addr_type` →
+                        // address_type column, `is_paired` → is_paired column).
+                        d.addrType?.let { put("addr_type", it) }
+                        d.isPaired?.let { put("is_paired", it) }
                     })
                 }
             })
@@ -376,6 +390,18 @@ class ApiClient(
                 }
             })
         }
+
+        // On-device GPS / MDM location. Mirrors agent-core-lite's payloadToJson
+        // (which already serialized these). The full agent-core serializer had
+        // diverged and omitted them, so tablet-agent (full core) CAPTURED and
+        // INJECTED the fix into HeartbeatPayload but never put it on the wire.
+        // Wire keys are snake_case per heartbeat convention; server-side
+        // EventController.trackHeartbeat destructures them into
+        // HeartbeatService.record → updateDeviceGeo (geo_lat/geo_lon).
+        payload.latitude?.let { put("latitude", it) }
+        payload.longitude?.let { put("longitude", it) }
+        payload.accuracyMeters?.let { put("accuracy_meters", it.toDouble()) }
+        payload.locationSource?.let { put("location_source", it) }
     }
 
     suspend fun sendCommandAck(
@@ -403,46 +429,6 @@ class ApiClient(
                 response.isSuccessful
             }
         }.onFailure { Log.w(TAG, "sendCommandAck failed", it) }.getOrDefault(false)
-    }
-
-    /**
-     * Send audience metrics to the API.
-     */
-    suspend fun sendAudienceMetrics(payload: AudienceMetricsPayload) = withContext(Dispatchers.IO) {
-        runCatching {
-            val json = JSONObject().apply {
-                payload.screenId?.let { put("screenId", it) }
-                put("fingerprint", payload.fingerprint)
-                put("timestamp", payload.timestamp)
-                put("intervalMs", payload.intervalMs)
-                put("viewerCount", payload.viewerCount)
-                put("peakViewerCount", payload.peakViewerCount)
-                put("attentionScore", payload.attentionScore)
-                put("demographics", JSONObject().apply {
-                    put("ageRanges", JSONObject(payload.demographics.ageRanges))
-                    put("genders", JSONObject(payload.demographics.genderEstimates))
-                })
-                put("dwellTime", JSONObject().apply {
-                    put("avg", payload.dwellTime.averageSeconds)
-                    put("max", payload.dwellTime.maxSeconds)
-                    put("min", payload.dwellTime.minSeconds)
-                    put("total", payload.dwellTime.totalViewerSeconds)
-                })
-                put("environment", JSONObject().apply {
-                    put("ambientLight", payload.environment.ambientLightLux)
-                    put("temperature", payload.environment.deviceTemperatureC)
-                    put("orientation", payload.environment.orientation)
-                })
-            }
-            val request = authRequestBuilder("${config.apiBaseUrl}/v2/earner/audience-metrics")
-                .post(json.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "sendAudienceMetrics failed: ${response.code}")
-                }
-            }
-        }.onFailure { Log.w(TAG, "sendAudienceMetrics failed", it) }
     }
 
     /**
@@ -496,6 +482,13 @@ class ApiClient(
             put("cameraCount", capabilities.audienceSensing.cameraCount)
             put("microphoneAvailable", capabilities.audienceSensing.microphoneAvailable)
             put("sensingMode", capabilities.audienceSensing.sensingMode)
+            // Belt-and-suspenders booleans for server-side cap_face_detection /
+            // cap_audio_classification (peppy-cooking-blum PR 1). The server
+            // still computes the multi-field fallback in pgRepo/devices.js so a
+            // legacy agent that omits these stays correct; emitting them lets
+            // a future server simplification read the single boolean directly.
+            put("faceDetection", capabilities.audienceSensing.faceDetection)
+            put("audioClassification", capabilities.audienceSensing.audioClassification)
             // 2026-05-03 fix-ctv-camera-never-started-product-fix: surface
             // CameraHealthMonitor's per-device gauge to the heartbeat. Lets
             // the server distinguish "camera open delivering frames" from
@@ -753,6 +746,50 @@ class ApiClient(
                     )
                 }
             }.onFailure { Log.w(TAG, "fetchApkManifest failed", it) }.getOrNull()
+        }
+
+    /**
+     * PR π (2026-06-01) — Fetch the active sensing profile for a screen from
+     * the server, used by [SensingProfileManager.fetchAndApplyServerProfile]
+     * as the cold-boot bootstrap (replaces "persisted SharedPrefs is the source
+     * of truth" with "server is authoritative; persisted is fallback").
+     *
+     * Backing route: `GET /v2/earner/sensing/profiles/:screenId` →
+     * `{ statusCode: 200, data: [profile1, profile2, ...] }` where each profile
+     * has the same JSON shape as the `updateSensingProfile` WS push payload
+     * (profile_id / profile_name / models / classes / thresholds /
+     * observation_families / capture_interval_ms / report_interval_ms /
+     * metrics_schema / program_spec / sensing_config / signals / vlm_prompt).
+     *
+     * Returns the FIRST entry in `data` (server-side ordering is
+     * `ORDER BY updated_at DESC` — see sensingProfileService.getProfilesForScreen),
+     * or null when there is no active profile, the screen ID is empty, the
+     * network is unavailable, or the response is malformed. The caller falls
+     * back to [SensingProfileManager.loadPersistedProfile] in the null case.
+     */
+    suspend fun fetchActiveSensingProfile(screenId: String): JSONObject? =
+        withContext(Dispatchers.IO) {
+            if (screenId.isBlank()) return@withContext null
+            runCatching {
+                val request = authRequestBuilder("${config.apiBaseUrl}/v2/earner/sensing/profiles/$screenId")
+                    .get()
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(TAG, "fetchActiveSensingProfile HTTP ${response.code} for screen=$screenId")
+                        return@use null
+                    }
+                    val body = response.body?.string() ?: return@use null
+                    val envelope = JSONObject(body)
+                    val data = envelope.opt("data")
+                    val profiles: JSONArray = when (data) {
+                        is JSONArray -> data
+                        else -> return@use null
+                    }
+                    if (profiles.length() == 0) return@use null
+                    profiles.optJSONObject(0)
+                }
+            }.onFailure { Log.w(TAG, "fetchActiveSensingProfile failed for screen=$screenId", it) }.getOrNull()
         }
 
     companion object {

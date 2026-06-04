@@ -80,9 +80,10 @@ object HeuristicEmotionalEngagementEstimator {
             leaningInCount = heuristics.count { it.leanDirection == LeanDirection.LEANING_IN },
             leaningBackCount = heuristics.count { it.leanDirection == LeanDirection.LEANING_BACK },
             avgLeanMagnitude = heuristics.map { it.leanMagnitude }.average().toFloat().coerceIn(0f, 1f),
-            stoppedCount = lingerCount,
-            walkingPastCount = 0,
-            approachingCount = 0,
+            // Heuristic estimator (no pose model) only knows lingering-face count;
+            // emit a single-state distribution. When pose model loads, AudienceAnalyzer's
+            // groupingBy.eachCount() takes over and surfaces all movement states.
+            movementDistribution = if (lingerCount > 0) mapOf(MovementState.STOPPED to lingerCount) else emptyMap(),
             avgMovementSpeed = 0f,
             bodyEngagementScore = ((avgAttention * 0.8f) + (facingScreenPct * 0.2f)).coerceIn(0f, 1f)
         )

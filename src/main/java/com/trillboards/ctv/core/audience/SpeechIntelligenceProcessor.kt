@@ -20,8 +20,6 @@ import java.util.concurrent.TimeUnit
 import com.trillboards.ctv.core.SensingConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -42,21 +40,30 @@ import com.k2fsa.sherpa.onnx.OfflineMoonshineModelConfig
  * - Only structured SpeechInsights are emitted, NEVER raw text
  * - No speaker identification or biometric data collected
  *
- * HYBRID RACE ARCHITECTURE:
+ * CLASSIFICATION ARCHITECTURE (PR δ):
  * 1. Continuous audio capture into rolling buffer
  * 2. Every [transcriptionIntervalMs]: transcribe audio chunk with Moonshine
- * 3. Race two classification paths in parallel:
- *    - Path A: MediaPipe Text Classifier (on-device, 50-150ms)
- *    - Path B: Server Gemini (accurate fallback, 500-800ms)
- * 4. Use first high-confidence result, fallback to InsightExtractor
- * 5. IMMEDIATELY zero-out transcript memory
- * 6. Emit SpeechInsights via callback
+ * 3. Classification priority (no regex fallback):
+ *    - Path 0 (PRIMARY): [OnDeviceLlmInsightExtractor] when
+ *      [SensingConfig.SpeechProcessingConfig.useLlmExtractor] = true AND model
+ *      is loaded. Non-null result skips path 1 entirely.
+ *    - Path 1: Cloud Gemini via /v2/earner/analyze-speech
+ *    - Both fail → emit [SpeechInsights](confidence=0f), server filters low-confidence
+ * 4. IMMEDIATELY zero-out transcript memory
+ * 5. Emit SpeechInsights via callback
  */
 class SpeechIntelligenceProcessor(
     private val context: Context,
     private val config: SpeechConfig = SpeechConfig(),
     private val fingerprint: String = "",
-    private val apiBaseUrl: String = "https://api.trillboards.com"
+    private val apiBaseUrl: String = "https://api.trillboards.com",
+    /**
+     * Optional on-device LLM extractor (PR L3).
+     * Null by default — preserves all existing constructor call-sites without changes.
+     * When non-null AND [SensingConfig.SpeechProcessingConfig.useLlmExtractor] = true
+     * AND [OnDeviceLlmInsightExtractor.isLoaded] = true, acts as the PRIMARY analyzer.
+     */
+    private val onDeviceLlmExtractor: OnDeviceLlmInsightExtractor? = null
 ) {
     companion object {
         private const val TAG = "SpeechIntelligence"
@@ -79,22 +86,20 @@ class SpeechIntelligenceProcessor(
     private var audioRecord: AudioRecord? = null
     private val audioBuffer = RollingAudioBuffer(config.audioBufferLengthMs, SAMPLE_RATE)
 
-    // Hybrid classification components
-    private var mediaPipeClassifier: MediaPipeTextClassifier? = null
+    // HTTP client for cloud Gemini fallback
     private var httpClient: OkHttpClient? = null
-    private var mediaPipeAvailable = false
-
-    // Confidence thresholds — read from SensingConfig for server-tunability
-    private val ON_DEVICE_CONFIDENCE_THRESHOLD: Float
-        get() = SensingConfig.get().speech.onDeviceConfidenceThreshold
-
-    private val NOISY_GEMINI_CONFIDENCE_THRESHOLD: Float
-        get() = SensingConfig.get().speech.noisyGeminiConfidenceThreshold
 
     // Audio classification processor reference for noise profile
     var audioClassificationProcessor: AudioClassificationProcessor? = null
 
-    @Volatile private var isRunning = false
+    @Volatile
+    private var isRunning = false
+
+    /** Test-only: mark as running without starting the audio pipeline. */
+    @Suppress("VisibleForTests")
+    internal fun setRunningForTest(value: Boolean) {
+        isRunning = value
+    }
 
     // Current insights state
     private val _currentInsights = MutableStateFlow(SpeechInsights())
@@ -287,42 +292,45 @@ class SpeechIntelligenceProcessor(
     }
 
     /**
-     * Initialize hybrid classification components.
-     * - MediaPipe Text Classifier for on-device classification
-     * - ApiClient for server-side Gemini fallback
+     * Initialize classification components:
+     * - [OnDeviceLlmInsightExtractor] (PRIMARY path, SSM-gated via useLlmExtractor)
+     * - OkHttpClient for cloud Gemini fallback (/v2/earner/analyze-speech)
+     *
+     * The LLM initialiser is launched in a coroutine so it does not block the
+     * audio pipeline while the model loads. If [useLlmExtractor] = false or
+     * [onDeviceLlmExtractor] = null the block is skipped entirely.
      */
     private fun initializeHybridClassification() {
-        // Initialize MediaPipe Text Classifier
-        try {
-            mediaPipeClassifier = MediaPipeTextClassifier(context)
-            if (mediaPipeClassifier?.hasModel() == true) {
-                mediaPipeAvailable = mediaPipeClassifier?.initialize() ?: false
-                if (mediaPipeAvailable) {
-                    Log.i(TAG, "MediaPipe Text Classifier initialized - on-device classification enabled")
-                } else {
-                    Log.w(TAG, "MediaPipe Text Classifier failed to initialize - using server fallback only")
+        // Initialize on-device LLM extractor if SSM flag is set
+        if (SensingConfig.get().speech.useLlmExtractor && onDeviceLlmExtractor != null) {
+            processorScope.launch(Dispatchers.Default) {
+                try {
+                    val ok = onDeviceLlmExtractor.initialize()
+                    if (ok) {
+                        Log.i(TAG, "OnDeviceLlmInsightExtractor initialized — PRIMARY analyzer active")
+                    } else {
+                        Log.w(TAG, "OnDeviceLlmInsightExtractor initialize() returned false — " +
+                            "falling back to cloud Gemini")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "OnDeviceLlmInsightExtractor initialization error", e)
                 }
-            } else {
-                Log.w(TAG, "MediaPipe intent model not found - using server fallback only")
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize MediaPipe classifier", e)
-            mediaPipeAvailable = false
         }
 
-        // Initialize OkHttpClient for Gemini fallback
+        // Initialize OkHttpClient for cloud Gemini fallback
         if (fingerprint.isNotEmpty()) {
             try {
                 httpClient = OkHttpClient.Builder()
                     .connectTimeout(10, TimeUnit.SECONDS)
                     .readTimeout(15, TimeUnit.SECONDS)
                     .build()
-                Log.i(TAG, "HttpClient initialized for Gemini fallback")
+                Log.i(TAG, "HttpClient initialized for cloud Gemini fallback")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize HttpClient", e)
             }
         } else {
-            Log.w(TAG, "No fingerprint provided - Gemini fallback disabled")
+            Log.w(TAG, "No fingerprint provided - cloud Gemini fallback disabled")
         }
     }
 
@@ -432,13 +440,12 @@ class SpeechIntelligenceProcessor(
     }
 
     /**
-     * Process the current audio buffer using hybrid race architecture:
+     * Process the current audio buffer:
      * 1. Get audio samples and check for meaningful audio
      * 2. Transcribe with Moonshine ASR
-     * 3. Race MediaPipe (on-device) vs Gemini (server) classification
-     * 4. Use first high-confidence result, fallback to keyword extraction
-     * 5. IMMEDIATELY delete transcript
-     * 6. Emit structured insights
+     * 3. Classify via LLM PRIMARY → cloud Gemini → empty SpeechInsights
+     * 4. IMMEDIATELY delete transcript
+     * 5. Emit structured insights
      */
     private suspend fun processAudioChunk() {
         // Get audio samples from buffer
@@ -483,7 +490,7 @@ class SpeechIntelligenceProcessor(
 
             Log.d(TAG, "Moonshine transcription length: ${transcript.length} chars")
 
-            // Use hybrid race architecture for classification
+            // Classify: LLM PRIMARY → cloud Gemini → empty
             val insights = analyzeWithHybridRace(transcript)
 
             // Check confidence threshold
@@ -498,7 +505,7 @@ class SpeechIntelligenceProcessor(
 
             Log.i(TAG, "Speech insights emitted: " +
                 "brands=${insights.brandMentions.size}, " +
-                "intent=${insights.purchaseIntent}, " +
+                "stage=${insights.purchaseJourney.stage}, " +
                 "sentiment=${insights.sentimentTone}, " +
                 "confidence=${insights.confidence}")
 
@@ -511,67 +518,57 @@ class SpeechIntelligenceProcessor(
     }
 
     /**
-     * Hybrid race classification: run MediaPipe and Gemini in parallel.
+     * Speech classification: LLM PRIMARY → cloud Gemini → empty (PR δ).
      *
-     * Strategy:
-     * 1. Start both classifiers in parallel
-     * 2. If MediaPipe returns with high confidence (>0.70), use it immediately
-     * 3. If server returns better result, use that
-     * 4. Fallback to keyword extraction if both fail
+     * Priority order:
+     *   0. **PRIMARY:** [OnDeviceLlmInsightExtractor] when
+     *      [SensingConfig.SpeechProcessingConfig.useLlmExtractor] = true AND
+     *      [OnDeviceLlmInsightExtractor.isLoaded] = true. A non-null return is used
+     *      immediately; path 1 is skipped. Null (timeout/parse failure) falls through.
+     *   1. **FALLBACK:** cloud Gemini via /v2/earner/analyze-speech.
+     *   Both fail → emit [SpeechInsights](confidence=0f); server discards low-confidence.
      *
-     * Privacy: Transcript is sent to server only, never logged/stored.
+     * No regex fallback. Privacy: transcript is sent to server only in path 1.
+     *
+     * Visibility: `internal` so unit tests in the same module can call directly.
      */
-    private suspend fun analyzeWithHybridRace(transcript: String): SpeechInsights {
-        return coroutineScope {
-            // Start both paths in parallel
-            val onDeviceDeferred = if (mediaPipeAvailable && mediaPipeClassifier != null) {
-                async(Dispatchers.Default) {
-                    runCatching { mediaPipeClassifier!!.classify(transcript) }
+    @Suppress("VisibleForTests")
+    internal suspend fun analyzeWithHybridRace(transcript: String): SpeechInsights {
+        // ── PATH 0: PRIMARY on-device LLM (SSM-gated, default OFF) ─────────
+        val speechCfg = SensingConfig.get().speech
+        if (speechCfg.useLlmExtractor && onDeviceLlmExtractor?.isLoaded() == true) {
+            val startMs = System.currentTimeMillis()
+            try {
+                val llmInsights = onDeviceLlmExtractor.analyze(transcript)
+                if (llmInsights != null) {
+                    Log.i(TAG, "PRIMARY LLM result used (${System.currentTimeMillis() - startMs}ms, " +
+                        "source=${llmInsights.classificationSource}, " +
+                        "brands=${llmInsights.brandMentions.size}, " +
+                        "stage=${llmInsights.purchaseJourney.stage})")
+                    return llmInsights
                 }
-            } else null
-
-            val serverDeferred = if (httpClient != null && fingerprint.isNotEmpty()) {
-                async(Dispatchers.IO) {
-                    runCatching { analyzeWithGeminiServer(transcript) }
-                }
-            } else null
-
-            // Await results
-            val onDeviceResult = onDeviceDeferred?.await()?.getOrNull()
-            val serverResult = serverDeferred?.await()?.getOrNull()
-
-            // Decision logic
-            when {
-                // On-device wins with high confidence
-                onDeviceResult != null &&
-                onDeviceResult.isValid() &&
-                onDeviceResult.confidence >= ON_DEVICE_CONFIDENCE_THRESHOLD -> {
-                    Log.d(TAG, "Using on-device result (${onDeviceResult.latencyMs}ms, " +
-                            "confidence=${onDeviceResult.confidence})")
-                    onDeviceResult.toSpeechInsights()
-                }
-
-                // Server result available and better
-                serverResult != null && serverResult.isValid() -> {
-                    Log.d(TAG, "Using server Gemini result (${serverResult.latencyMs}ms, " +
-                            "brands=${serverResult.brands.size})")
-                    serverResult.toSpeechInsights()
-                }
-
-                // On-device available but low confidence - still better than keyword fallback
-                onDeviceResult != null && onDeviceResult.isValid() -> {
-                    Log.d(TAG, "Using on-device (low confidence fallback, " +
-                            "confidence=${onDeviceResult.confidence})")
-                    onDeviceResult.toSpeechInsights()
-                }
-
-                // Last resort: keyword extraction
-                else -> {
-                    Log.w(TAG, "Both classifiers failed, using keyword fallback")
-                    InsightExtractor.extract(transcript)
-                }
+                Log.d(TAG, "PRIMARY LLM returned null (${System.currentTimeMillis() - startMs}ms) " +
+                    "— falling through to cloud Gemini")
+            } catch (e: Exception) {
+                Log.e(TAG, "PRIMARY LLM threw unexpectedly — falling through to cloud Gemini", e)
             }
         }
+
+        // ── PATH 1: FALLBACK — cloud Gemini ─────────────────────────────────
+        if (httpClient != null && fingerprint.isNotEmpty()) {
+            val serverResult = withContext(Dispatchers.IO) {
+                runCatching { analyzeWithGeminiServer(transcript) }.getOrNull()
+            }
+            if (serverResult != null && serverResult.isValid()) {
+                Log.d(TAG, "Using cloud Gemini result (${serverResult.latencyMs}ms, " +
+                    "brands=${serverResult.brands.size})")
+                return serverResult.toSpeechInsights()
+            }
+        }
+
+        // Both paths failed — emit empty so the server's low-confidence filter handles it
+        Log.w(TAG, "Both LLM and cloud Gemini failed — emitting empty SpeechInsights(confidence=0f)")
+        return SpeechInsights(confidence = 0f)
     }
 
     /**
@@ -705,10 +702,14 @@ class SpeechIntelligenceProcessor(
         moonshineRecognizer = null
         moonshineInitialized = false
 
-        // Clean up hybrid classification components
-        mediaPipeClassifier?.close()
-        mediaPipeClassifier = null
-        mediaPipeAvailable = false
+        // Clean up on-device LLM extractor (PR L3)
+        try {
+            onDeviceLlmExtractor?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing OnDeviceLlmInsightExtractor during stop", e)
+        }
+
+        // Release HTTP client
         httpClient = null
 
         audioBuffer.clear()
@@ -726,14 +727,6 @@ class SpeechIntelligenceProcessor(
      */
     fun getLatestInsights(): SpeechInsights = _currentInsights.value
 
-    /**
-     * Set dynamic brands for keyword detection.
-     * Delegates to InsightExtractor which is used as the keyword fallback path.
-     */
-    fun setDynamicBrands(brands: List<String>) {
-        InsightExtractor.setDynamicBrands(brands)
-        Log.i(TAG, "Dynamic brands updated: ${brands.size} brands")
-    }
 }
 
 /**

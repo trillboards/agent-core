@@ -56,7 +56,16 @@ data class DeviceCapabilityPayload(
         val cameraCount: Int = 0,
         val microphoneAvailable: Boolean = false,
         val sensingMode: String = "NONE",  // "FULL", "FACE_ONLY", "AUDIO_ONLY", "NONE"
-        val cameraHealth: CameraHealth = CameraHealth()
+        val cameraHealth: CameraHealth = CameraHealth(),
+        // Belt-and-suspenders for server-side cap_face_detection / cap_audio_classification
+        // derivation (peppy-cooking-blum PR 1). The server already derives these from
+        // cameraAvailable/microphoneAvailable + sensingMode, but emitting them here too
+        // means a future server-side simplification can drop the multi-field derivation
+        // and read these directly. Computed in AudienceSensingService.getAudienceSensingCapabilities():
+        //   faceDetection = cameraAvailable && sensingMode in {FACE_ONLY, FULL}
+        //   audioClassification = microphoneAvailable && sensingMode in {AUDIO_ONLY, FULL}
+        val faceDetection: Boolean = false,
+        val audioClassification: Boolean = false
     )
 
     /**

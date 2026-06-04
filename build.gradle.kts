@@ -231,13 +231,17 @@ dependencies {
     // LiteRT-LM SDK for on-device VLM inference with GPU delegate.
     // KV cache crash fixed via createFreshConversation() per inference in LiteRTLMEngine.
     // Server selects litert-lm format for GPU-capable devices (MediaTek, Qualcomm).
-    runtimeOnly("com.google.ai.edge.litertlm:litertlm-android:0.9.0") {
+    runtimeOnly("com.google.ai.edge.litertlm:litertlm-android:0.12.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-reflect")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
         exclude(group = "org.jetbrains.kotlinx")
     }
+
+    // Location (FusedLocationProviderClient) + UMP consent — present in current agent-core.
+    implementation("com.google.android.gms:play-services-location:21.0.1")
+    implementation("com.google.android.ump:user-messaging-platform:4.0.0")
 
     // sherpa-onnx for Moonshine ASR (replacing Whisper TFLite)
     //

@@ -134,10 +134,10 @@ internal object ObservationProgramJson {
 
         return ObservationProgramRuntimeContract(
             objective = programSpec.optJSONObject("observation_program")?.optString("objective")?.takeIf { it.isNotBlank() },
-            staticSemantics = parseWorkerContract("static_semantics", inferenceContract.optJSONObject("static_semantics")),
-            temporalSemantics = parseWorkerContract("temporal_semantics", inferenceContract.optJSONObject("temporal_semantics")),
-            speechSemantics = parseWorkerContract("speech_semantics", inferenceContract.optJSONObject("speech_semantics")),
-            physicalCorroboration = parseWorkerContract("physical_corroboration", inferenceContract.optJSONObject("physical_corroboration")),
+            staticSemantics = parseWorkerContract("static_semantics", inferenceContract.optJSONObject("static_semantics"), parseOutputs = false),
+            temporalSemantics = parseWorkerContract("temporal_semantics", inferenceContract.optJSONObject("temporal_semantics"), parseOutputs = true),
+            speechSemantics = parseWorkerContract("speech_semantics", inferenceContract.optJSONObject("speech_semantics"), parseOutputs = false),
+            physicalCorroboration = parseWorkerContract("physical_corroboration", inferenceContract.optJSONObject("physical_corroboration"), parseOutputs = false),
             fusionMode = programSpec.optJSONObject("fusion_contract")?.optString("mode")?.takeIf { it.isNotBlank() },
             joinWindowMs = programSpec.optJSONObject("fusion_contract")
                 ?.opt("join_window_ms")
@@ -154,7 +154,7 @@ internal object ObservationProgramJson {
         }
     }
 
-    private fun parseWorkerContract(key: String, workerJson: JSONObject?): ObservationWorkerContract? {
+    private fun parseWorkerContract(key: String, workerJson: JSONObject?, parseOutputs: Boolean = false): ObservationWorkerContract? {
         if (workerJson == null) {
             return null
         }
@@ -164,7 +164,7 @@ internal object ObservationProgramJson {
             worker = workerJson.optString("worker").takeIf { it.isNotBlank() } ?: key,
             enabled = workerJson.optBoolean("enabled", false),
             modelIds = jsonStringList(workerJson.optJSONArray("model_ids")),
-            outputs = jsonStringList(workerJson.optJSONArray("outputs")),
+            outputs = if (parseOutputs) jsonStringList(workerJson.optJSONArray("outputs")) else emptyList(),
             primaryFocus = workerJson.optString("primary_focus").takeIf { it.isNotBlank() }
         )
     }

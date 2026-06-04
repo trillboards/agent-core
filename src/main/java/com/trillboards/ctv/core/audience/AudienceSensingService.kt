@@ -71,6 +71,28 @@ internal fun <T> wireExistingCaptureIfReady(
 }
 
 /**
+ * CRITICAL-only memory backstop decision (pure, so it is unit-tested without an
+ * Android Context). Returns CRITICAL only when the device is at the OOM brink (lmkd
+ * kill imminent), otherwise NORMAL.
+ *
+ * We deliberately do NOT escalate at MEDIUM/HIGH pressure: a 3-4 GB CTV device idles
+ * near those thresholds and the product requirement is to "keep the zoo" (full
+ * sensing) until genuinely about to crash. Only at CRITICAL do we shed enrichment
+ * models to survive — face + YAMNet + VAS stay on at every tier, so the edge->cloud
+ * attestation signal is preserved.
+ */
+internal fun criticalMemoryBackstopTier(
+    lowMemory: Boolean,
+    availableRamPercent: Float,
+    criticalThresholdPercent: Float = 15f
+): MemoryAttenuationManager.AttenuationTier =
+    if (lowMemory || availableRamPercent < criticalThresholdPercent) {
+        MemoryAttenuationManager.AttenuationTier.CRITICAL
+    } else {
+        MemoryAttenuationManager.AttenuationTier.NORMAL
+    }
+
+/**
  * Orchestrates audience sensing by coordinating face detection and audio classification.
  *
  * Features:
@@ -109,6 +131,9 @@ class AudienceSensingService(
     private var audienceAnalyzer: AudienceAnalyzer? = null
     private var audioProcessor: AudioClassificationProcessor? = null
     private var speechProcessor: SpeechIntelligenceProcessor? = null
+    /** Eagerly-initialized LLM extractor (PR L3). Stored here so it is passed to
+     *  [SpeechIntelligenceProcessor] and lives for the service lifetime. */
+    @Volatile private var onDeviceLlmExtractor: OnDeviceLlmInsightExtractor? = null
     private var frameCaptureManager: FrameCaptureManager? = null
 
     // VLM perception-triggered inference (Phase 5B)
@@ -160,6 +185,17 @@ class AudienceSensingService(
     private var latestDemographics: DemographicsResult? = null
     @Volatile private var lastEdgeQualityTelemetry: EdgeQualityTelemetry? = null
 
+    // Mirror of the last per_face_observations array emitted on the
+    // audienceSignals WS feed, snapshotted at drain time. Consumed by
+    // FrameCaptureManager's HTTP POST (perFaceSnapshotProvider) so the cloud
+    // persistence layer — which reads from /v2/earner/audience-analyze, not
+    // the WS feed — actually receives per-(face × creative) attribution rows.
+    // Without this bridge, the WS emitted them but the HTTP path dropped
+    // them, leading to fleet-wide 0% per_face_observations fill. Stays as
+    // last-known until the next drain. Empty JSONArray when no faces × ad
+    // attribution has happened yet this device session.
+    @Volatile private var latestPerFaceSnapshot: org.json.JSONArray = org.json.JSONArray()
+
     // Cached HardwareManifest — hardware doesn't change at runtime, detect once
     @Volatile private var cachedHardwareManifest: HardwareManifest? = null
 
@@ -204,6 +240,7 @@ class AudienceSensingService(
     private val audioMetricsBuffer = ArrayDeque<AudioMetrics>()
     private val speechInsightsBuffer = ArrayDeque<SpeechInsights>()
 
+
     /**
      * Phase 4 PR 8: per-class binned counts for the YAMNet classifier output.
      * Snapshot lands in audienceSignals.audio_class_histogram (typed map),
@@ -220,6 +257,17 @@ class AudienceSensingService(
     private val footTrafficEstimator = FootTrafficEstimator()
 
     private var lastAggregationTime = System.currentTimeMillis()
+
+    // PR 10 diagnostic: throttle the AgeGenderProcessor load-gate diag log so
+    // we don't flood logcat. aggregateAndEmit runs every 10s; this lets the
+    // gate-state breadcrumb print at most once per ~30s. The gate is read in
+    // aggregateAndEmit's onDeviceDemographics emit block (~line 2518); the
+    // diag captures tierOk / processorPresent / hasFaces independently so the
+    // next operator can tell from logcat whether FaceXFormer is bypassed by
+    // (a) tier attenuation, (b) model not OTA-downloaded, or (c) no faces
+    // accumulated this window (the symptom 0/857,819 audience_metrics rows
+    // had on_device_age_distribution populated in the last 7d).
+    private var lastAgeGenderDiagLogMs = 0L
 
     // Screen ID (set when screen is registered)
     @Volatile private var screenId: String? = null
@@ -887,7 +935,16 @@ class AudienceSensingService(
         lifecycleOwnerRef = lifecycleOwner
         sensingConfig = config
 
-        // Initialize memory attenuation manager
+        // Initialize memory attenuation manager.
+        // zeroAllocPipelineActive intentionally stays FALSE: codex P1 review on
+        // PR #6229 correctly observed that setting it true short-circuits
+        // MemoryAttenuationManager.getCurrentTier() / transitionTo() to NORMAL
+        // unconditionally, which disables shedding of age/gender/pose/gaze
+        // even when the loaded models themselves push us into low-RAM/OOM
+        // territory. Zero per-frame allocation does NOT eliminate model-weight
+        // memory pressure. Proper fix (separating GC-pressure attenuation from
+        // model-memory attenuation in the manager itself) is tracked in the
+        // follow-up plan; this stays defensive.
         attenuationManager = MemoryAttenuationManager(
             zeroAllocPipelineActive = false,
             onTierChanged = { oldTier, newTier, modelStatusMap ->
@@ -1042,11 +1099,6 @@ class AudienceSensingService(
         )
 
         audienceAnalyzer = AudienceAnalyzer(context, analyzerConfig).apply {
-            onMetricsReady = { payload ->
-                // Don't use the analyzer's report callback - we aggregate ourselves
-                Log.d(TAG, "[FaceDetection] Analyzer payload received (ignored - using aggregation)")
-            }
-
             // Wire camera health heartbeat to prevent RecoveryLadder false-positive
             onFrameProcessed = {
                 onCameraHealthHeartbeat?.invoke()
@@ -1200,6 +1252,107 @@ class AudienceSensingService(
 
         audienceAnalyzer?.start(lifecycleOwner)
         Log.i(TAG, "[FaceDetection] >>> Face detection started - waiting for camera bind...")
+
+        // Age/gender (FaceXFormer) foundation-model OTA at pipeline startup.
+        //
+        // Root cause this fixes: the only path that previously kicked the
+        // age_gender download was applyProfileToInference() (a profile (re)apply
+        // event). On a freshly-booted device the persisted-profile apply runs
+        // BEFORE this start() creates `audienceAnalyzer`, so
+        // triggerAgeGenderOtaDownloadIfNeeded() short-circuited on its
+        // `audienceAnalyzer ?: return` guard and the 178MB model was never
+        // fetched — AudienceAnalyzer.initializeEmotionalEngagement() then found
+        // no model, logged "Age/gender model not available (optional)", and left
+        // ageGenderProcessor = null forever. We now (re)attempt the download from
+        // the pipeline-startup path too, gated by the same eligibility the
+        // profile already enforces (active profile includes `age_gender`).
+        startAgeGenderOtaStartupRetryIfEligible()
+    }
+
+    /**
+     * Drive a BOUNDED, backed-off retry of the age/gender model OTA download at
+     * vision-pipeline startup. Eligibility, cadence and the stop condition live
+     * in [AgeGenderOtaRetryPolicy] (pure + unit-tested).
+     *
+     * - Attempt 0 fires immediately (analyzer now exists, so the existing
+     *   trigger's `audienceAnalyzer ?: return` guard passes).
+     * - Each attempt calls the EXISTING [triggerAgeGenderOtaDownloadIfNeeded] —
+     *   we do NOT reinvent the manifest fetch/download. That method already
+     *   probes AgeGenderProcessor.hasModel(); when the model is on disk it kicks
+     *   AudienceAnalyzer.startAgeGenderProcessor() and the next heartbeat emits
+     *   real demographics.
+     * - The loop exits early the moment the processor is live (model landed),
+     *   and otherwise gives up after [AgeGenderOtaRetryPolicy.MAX_ATTEMPTS] so a
+     *   permanently-offline kiosk never polls the manifest endpoint forever. A
+     *   later profile (re)apply still re-triggers the existing path.
+     *
+     * This is the watchdog-style "idempotent recovery re-invoked on a backed-off
+     * schedule" pattern (mirrors LocationCollector.start() re-invocation and the
+     * CameraHealthMonitor backoff ladder), adapted for a one-shot model fetch.
+     */
+    /**
+     * Is `age_gender` wanted by the CURRENT EFFECTIVE model set? Resolved the
+     * SAME way [applyProfileToInference] resolves processor activation —
+     * `resolveEffectiveModels(activeProfileModels, activeProgramRuntimeContract)`
+     * — so the startup OTA gate never diverges from the processor lifecycle.
+     * When a runtime contract supplies explicit worker models that drop
+     * `age_gender`, the effective set drops it too and we must NOT download the
+     * ~178MB artifact. Reads the @Volatile profile + contract fields live, so
+     * callers re-evaluating mid-loop pick up a profile re-apply.
+     */
+    private fun isAgeGenderEffectivelyWanted(): Boolean {
+        val effectiveModels = resolveEffectiveModels(activeProfileModels, activeProgramRuntimeContract)
+        return AgeGenderOtaRetryPolicy.isEligible(effectiveModels)
+    }
+
+    private fun startAgeGenderOtaStartupRetryIfEligible() {
+        if (!isAgeGenderEffectivelyWanted()) {
+            Log.d(TAG, "[Profile] Age/gender not in effective model set — skipping startup OTA trigger")
+            return
+        }
+
+        // Already on disk + processor live (e.g. asset-bundled build, or a prior
+        // profile-apply already landed it) — nothing to download.
+        if (audienceAnalyzer?.getAgeGenderProcessor() != null) {
+            Log.d(TAG, "[Profile] Age/gender processor already active — skipping startup OTA trigger")
+            return
+        }
+
+        Log.i(TAG, "[Profile] Age/gender eligible but processor not active — starting bounded startup OTA retry")
+
+        sensingScope.launch(Dispatchers.IO) {
+            var attempt = 0
+            while (isActive && isRunning && !AgeGenderOtaRetryPolicy.hasExhausted(attempt)) {
+                // Re-check eligibility against the CURRENT effective model set on
+                // every iteration: if the profile is re-applied without
+                // age_gender (or a runtime contract drops it) while we're
+                // looping, stop — demographics are no longer requested, so we
+                // must not keep retrying / downloading.
+                if (!isAgeGenderEffectivelyWanted()) {
+                    Log.i(TAG, "[Profile] Age/gender no longer in effective model set after $attempt attempt(s) — stopping retry")
+                    return@launch
+                }
+
+                // Stop the moment a prior attempt (or a concurrent profile-apply)
+                // landed the model and brought the processor up.
+                if (audienceAnalyzer?.getAgeGenderProcessor() != null) {
+                    Log.i(TAG, "[Profile] Age/gender processor active after $attempt startup attempt(s) — stopping retry")
+                    return@launch
+                }
+
+                Log.i(TAG, "[Profile] Age/gender startup OTA attempt ${attempt + 1}/${AgeGenderOtaRetryPolicy.MAX_ATTEMPTS}")
+                triggerAgeGenderOtaDownloadIfNeeded()
+
+                attempt++
+                if (AgeGenderOtaRetryPolicy.hasExhausted(attempt)) break
+                delay(AgeGenderOtaRetryPolicy.computeNextRetryDelayMs(attempt - 1))
+            }
+
+            if (audienceAnalyzer?.getAgeGenderProcessor() == null) {
+                Log.w(TAG, "[Profile] Age/gender startup OTA retry exhausted after $attempt attempts — " +
+                    "processor still inactive (a later profile re-apply will retry)")
+            }
+        }
     }
 
     private fun startAudioClassification(config: SensingConfig) {
@@ -1278,6 +1431,12 @@ class AudienceSensingService(
      *
      * PRIVACY: Transcripts are ephemeral - processed in memory and immediately deleted.
      * Only structured SpeechInsights are emitted, never raw text.
+     *
+     * Eagerly initialises the [OnDeviceLlmInsightExtractor] in a background coroutine
+     * so the model is warm before the first speech window arrives. If the model has not
+     * been downloaded yet, triggers an OTA download via [ModelDownloadManager].
+     * PR L3 will wire the ready extractor into [SpeechIntelligenceProcessor]; for now
+     * the eager-init path exists so cold-start download completes before L3 ships.
      */
     private fun startSpeechIntelligence(config: SensingConfig) {
         val speechConfig = SpeechConfig(
@@ -1287,11 +1446,107 @@ class AudienceSensingService(
             minConfidenceThreshold = 0.3f
         )
 
+        // Eagerly kick off LLM extractor init in the background — NOT lazy on first speech
+        // window, which would block the real-time audio pipeline on cold-start download.
+        // PR L3: the extractor is stored in [onDeviceLlmExtractor] so SpeechIntelligenceProcessor
+        // can call it when SensingConfig.speech.useLlmExtractor becomes true (PR L5 SSM flip).
+        val downloadManager = com.trillboards.ctv.core.ml.ModelDownloadManager(context)
+        val llmExtractor = OnDeviceLlmInsightExtractor(
+            context = context,
+            modelDownloadManager = downloadManager,
+            signalsJsonSupplier = { activeSignalsJson },
+            attenuationManager = attenuationManager
+        )
+        // Store extractor as service field so SpeechIntelligenceProcessor receives it below.
+        onDeviceLlmExtractor = llmExtractor
+
+        sensingScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val initialized = llmExtractor.initialize()
+            if (!initialized) {
+                // Model not yet downloaded — fetch the manifest and start OTA download so the
+                // model is resident before L5 flips the SSM flag to activate the primary path.
+                if (!downloadManager.isModelAvailable("functiongemma_270m")) {
+                    Log.i(TAG, "[Speech] FunctionGemma 270M not on device — fetching manifest for OTA download")
+                    try {
+                        val params = StringBuilder("device_tier=standard")
+                        screenId?.let { params.append("&screen_id=$it") }
+                        if (fingerprint.isNotEmpty()) params.append("&fingerprint=$fingerprint")
+                        val manifestUrl = "${apiBaseUrl}/v2/earner/ml/model-manifest?$params"
+
+                        val request = okhttp3.Request.Builder().url(manifestUrl).build()
+                        val client = okhttp3.OkHttpClient.Builder()
+                            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                            .build()
+                        val response = client.newCall(request).execute()
+                        val body = response.body?.string()
+                        response.close()
+
+                        if (body == null || !response.isSuccessful) {
+                            Log.w(TAG, "[Speech] FunctionGemma manifest fetch failed: HTTP ${response.code}")
+                        } else {
+                            val json = org.json.JSONObject(body)
+                            val models = json.optJSONObject("models")
+                            val entry = models?.optJSONObject("functiongemma_270m")
+                            val downloadUrl = entry?.optString("url", "") ?: ""
+                            if (downloadUrl.isEmpty()) {
+                                Log.i(TAG, "[Speech] FunctionGemma 270M not yet in manifest — " +
+                                    "will download on next profile sync when server registers the model")
+                            } else {
+                                val checksum = if (entry!!.isNull("hash")) "" else entry.optString("hash", "")
+                                val sizeBytes = entry.optLong("size_bytes", 0)
+                                val format = entry.optString("format", "")
+                                Log.i(TAG, "[Speech] FunctionGemma OTA download starting: " +
+                                    "size=${sizeBytes / (1024 * 1024)}MB, format=$format")
+                                val manifest = com.trillboards.ctv.core.ml.ModelDownloadManager.ModelManifest(
+                                    modelId = "functiongemma_270m",
+                                    downloadUrl = downloadUrl,
+                                    checksumSha256 = checksum,
+                                    sizeBytes = sizeBytes,
+                                    modelFormat = format
+                                )
+                                downloadManager.downloadModel(manifest).collect { progress ->
+                                    when (progress.state) {
+                                        com.trillboards.ctv.core.ml.ModelDownloadManager.DownloadState.DOWNLOADING -> {
+                                            if (progress.percentComplete.toInt() % 25 == 0) {
+                                                Log.i(TAG, "[Speech] FunctionGemma download: ${progress.percentComplete.toInt()}%")
+                                            }
+                                        }
+                                        com.trillboards.ctv.core.ml.ModelDownloadManager.DownloadState.COMPLETE -> {
+                                            Log.i(TAG, "[Speech] FunctionGemma 270M download complete — " +
+                                                "model resident and wired into SpeechIntelligenceProcessor; " +
+                                                "will activate when L5 flips speech.useLlmExtractor=true")
+                                        }
+                                        com.trillboards.ctv.core.ml.ModelDownloadManager.DownloadState.FAILED -> {
+                                            Log.e(TAG, "[Speech] FunctionGemma 270M download FAILED — " +
+                                                "will retry on next profile apply")
+                                        }
+                                        else -> { /* ignore other states */ }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[Speech] FunctionGemma OTA download error: ${e.message}", e)
+                    }
+                } else {
+                    Log.d(TAG, "[Speech] LLM extractor initialization blocked (policy/memory) — " +
+                        "will retry when SensingConfig.speech.useLlmExtractor=true next heartbeat")
+                }
+            } else {
+                Log.i(TAG, "[Speech] OnDeviceLlmInsightExtractor ready (model=functiongemma_270m) — " +
+                    "wired into SpeechIntelligenceProcessor; PRIMARY path activates at L5 SSM flip")
+            }
+        }
+
+        // Mirror the audioClassificationProcessor wiring pattern (line 1421):
+        // construct SpeechIntelligenceProcessor with the already-stored llmExtractor.
         speechProcessor = SpeechIntelligenceProcessor(
             context = context,
             config = speechConfig,
             fingerprint = fingerprint,
-            apiBaseUrl = apiBaseUrl
+            apiBaseUrl = apiBaseUrl,
+            onDeviceLlmExtractor = onDeviceLlmExtractor
         ).apply {
             // Wire noise profile from audio classifier for noise-robust preprocessing
             audioClassificationProcessor = audioProcessor
@@ -1309,10 +1564,11 @@ class AudienceSensingService(
                 if (insights.hasBrandMentions() || insights.hasActionablePurchaseSignals()) {
                     Log.i(TAG, "[Speech] >>> ACTIONABLE INSIGHT: " +
                             "brands=${insights.brandMentions}, " +
-                            "intent=${insights.purchaseIntent}, " +
+                            "stage=${insights.purchaseJourney.stage}, " +
                             "objections=${insights.objections}")
                 }
             }
+
         }
 
         speechProcessor?.start()
@@ -1336,6 +1592,14 @@ class AudienceSensingService(
                 setScreenId(it)
                 Log.d(TAG, "[FrameCapture] Screen ID set: $it")
             }
+
+            // Phase 1c → HTTP-POP bridge. Mirror the WS-emitted per_face
+            // snapshot onto every /v2/earner/audience-analyze POST so the
+            // cloud persistence path actually receives per-(face × creative)
+            // attribution rows. Pre-fix the WS feed emitted them, the HTTP
+            // body didn't, so audienceMetricsService never persisted them
+            // → fleet-wide 0% per_face_observations fill.
+            perFaceSnapshotProvider = { latestPerFaceSnapshot }
 
             edgeQualityProvider = {
                 buildEdgeQualityTelemetry(
@@ -1396,6 +1660,15 @@ class AudienceSensingService(
                         put("tflite_dominant_emotion", dominantEmotion)
                     }
                 }
+            }
+
+            // Phase 1b: thread content state through to the JPEG REST payload
+            // so audience_metrics / observation_stream rows carry currentAdId.
+            // Forward the service-level ContentStateProvider (set by tablet-agent
+            // via setContentStateProvider) into the capture manager. Android-TV
+            // builds leave both nulls, which the manager serializes as JSON null.
+            this@AudienceSensingService.contentStateProvider?.let { provider ->
+                contentStateProvider = provider
             }
 
             // Handle demographics results
@@ -1681,6 +1954,21 @@ class AudienceSensingService(
         val availableRamPercent = ((memInfo.availMem.toDouble() / memInfo.totalMem.toDouble()) * 100).toFloat()
         attenuationManager?.checkForRestoration(availableRamPercent)
 
+        // CRITICAL-only memory backstop. This 10s loop computes pressure but used to
+        // only ever DE-escalate (checkForRestoration above); the sole escalation path
+        // was onTrimMemory, which doesn't fire under zram on Android 16, so the device
+        // could thrash straight into an lmkd kill with no defense. Close the loop: at
+        // the OOM brink only, shed enrichment (age/gender, pose, emotion, gaze, speech,
+        // VLM) to survive. Face + YAMNet + VAS stay on at CRITICAL, so attestation is
+        // preserved; the full zoo runs untouched at MEDIUM/HIGH. transitionTo() applies
+        // hysteresis so this can't thrash.
+        if (criticalMemoryBackstopTier(memInfo.lowMemory, availableRamPercent)
+                == MemoryAttenuationManager.AttenuationTier.CRITICAL) {
+            Log.w(TAG, "[MemoryPressure] CRITICAL backstop: avail=${availableRamPercent.toInt()}%, " +
+                    "lowMemory=${memInfo.lowMemory} — shedding enrichment to avoid OOM (face/YAMNet/VAS stay on)")
+            attenuateToTier(MemoryAttenuationManager.AttenuationTier.CRITICAL)
+        }
+
         if (javaHeapPercent > 85 || systemMemoryPercent > 90) {
             Log.w(TAG, "[MemoryPressure] java=$javaHeapPercent%, native=${nativeHeapMb}MB, system=$systemMemoryPercent% — emitting anyway (data must flow)")
         }
@@ -1775,7 +2063,29 @@ class AudienceSensingService(
             val mean = luxValues.average().toFloat()
             luxValues.map { (it - mean) * (it - mean) }.average().toFloat()
         } else 0f
-        val viewabilityScore = audienceAnalyzer?.getSensorCollector()?.getViewabilityScore()
+        // Real IAB MRC-shaped viewability: face_count > 0 AND dwell ≥ 1s
+        // AND attention sustained, multiplied by environmental lighting
+        // factor. Returns null when no face was observed in the window
+        // (no face = nothing was viewable). The prior implementation
+        // returned a lux-only bucket that was 1.0 for any indoor light
+        // (50–500 lux), masquerading as a buyer-grade signal.
+        val environmentalFactor = audienceAnalyzer?.getSensorCollector()
+            ?.getEnvironmentalViewabilityFactor()
+        val viewabilityScore: Float? = if (avgFaceCount < 0.5) {
+            // No face seen → nothing was viewable; emit null
+            null
+        } else {
+            // avgDwellMs and avgAttention are Double (from .average()); compute
+            // in Double then narrow to Float at emission. Keeps math precise
+            // and lets the wire field stay Float? for backward-compat.
+            val dwellSec = (avgDwellMs / 1000.0).coerceAtLeast(0.0)
+            val durationFactor = (dwellSec / 1.0).coerceIn(0.0, 1.0)  // IAB MRC ≥1s = full
+            val attentionFactor = avgAttention.coerceIn(0.0, 1.0)
+            // environmentalFactor null → no light reading; treat as 1.0
+            // (don't penalize devices with absent light sensor)
+            val envFactor = (environmentalFactor ?: 1f).toDouble()
+            (durationFactor * attentionFactor * envFactor).coerceIn(0.0, 1.0).toFloat()
+        }
 
         val crowdedPct = if (audioSnapshots.isNotEmpty()) {
             audioSnapshots.count { it.isCrowded } / audioSnapshots.size.toFloat()
@@ -1786,20 +2096,51 @@ class AudienceSensingService(
             .maxByOrNull { it.value.size }
             ?.key ?: "unknown"
 
-        // Aggregate enhanced audio metrics
-        val avgAdReceptivity = if (audioSnapshots.isNotEmpty()) {
+        // Aggregate enhanced audio metrics. cosmic-brewing-bear C2: drop the
+        // `?: 0.5` and `?: "0-5"` magic fallbacks. When no audio data exists
+        // in the window, emit null upward — the server's
+        // networkAggregationService already tolerates null per PR #5003.
+        val avgAdReceptivity: Double? = if (audioSnapshots.isNotEmpty()) {
             audioSnapshots.map { it.adReceptivityScore.toDouble() }.average()
-        } else 0.5
+        } else null
 
-        val estimatedOccupancy = audioSnapshots
-            .groupBy { it.estimatedOccupancy }
-            .maxByOrNull { it.value.size }
-            ?.key ?: "0-5"
+        // Mic-noise-tier "0-5"/"5-20"/"20-50"/"50+" buckets were deleted from
+        // AudioMetrics in cosmic-brewing-bear C1. The aggregated occupancy
+        // string is gone with them; consumers should read raw scalars
+        // (audio_db_max, crowd_voice_count_estimate, audio_class_event_counts)
+        // and derive their own thresholds, or read face-backed occupancy from
+        // the server resolution path.
+        val estimatedOccupancy: String? = null
 
         val inferredVenueType = audioSnapshots
             .groupBy { it.inferredVenueType }
             .maxByOrNull { it.value.size }
             ?.key ?: "unknown"
+
+        // Raw audio scalars from the AudioMetrics windows. dBFS values use
+        // -120 as the silence floor (NOT a magic data value — it's the
+        // documented dynamic-range bottom for PCM_FLOAT). When the buffer is
+        // empty we emit null instead of a fabricated zero/floor.
+        val audioDbMax: Float? = if (audioSnapshots.isNotEmpty()) {
+            audioSnapshots.map { it.audioDbMax }.max()
+        } else null
+        val audioDbMean: Float? = if (audioSnapshots.isNotEmpty()) {
+            audioSnapshots.map { it.audioDbMean.toDouble() }.average().toFloat()
+        } else null
+        // crowd_voice_count: peak across the window when at least one window
+        // had a confident reading. Returns null when every window was null
+        // (no confident speech anywhere in the window). NOT zero — null is
+        // the honest "we don't know".
+        val crowdVoiceCountEstimate: Int? = audioSnapshots
+            .mapNotNull { it.crowdVoiceCountEstimate }
+            .maxOrNull()
+        // event_counts: sum across windows. Empty map (no events ever fired)
+        // is intentional — server-side fanout treats absent as no events,
+        // identical to a zero-count map.
+        val audioClassEventCounts: Map<String, Int> = audioSnapshots
+            .flatMap { it.audioClassEventCounts.entries }
+            .groupBy({ it.key }, { it.value })
+            .mapValues { (_, counts) -> counts.sum() }
 
         // Aggregate speech insights
         // Skip if tier >= CRITICAL (speech processor unloaded)
@@ -1877,6 +2218,24 @@ class AudienceSensingService(
             null
         }
 
+        // Phase 1c — propagate the current creative ID into the
+        // AudienceAnalyzer's per-(face × creative) accumulator. Subsequent
+        // per-frame samples will bucket under this pair until the next
+        // window flush (when drainPerAdAttention runs below).
+        //
+        // 2026-05-11 — creativeId broadens this beyond IMA programmatic:
+        // self_promo, sponsored, default_stream items now attribute attention
+        // too. Pre-fix, contentState.adId was only non-null for IMA ads, so
+        // perAdAttention stayed empty for the 95%+ of fleet playback that's
+        // non-IMA, and Phase 1c emitted nothing fleet-wide. Falling back to
+        // adId preserves the IMA-only behavior when the JS bridge somehow
+        // didn't populate creativeId.
+        audienceAnalyzer?.setCurrentAd(
+            contentState?.creativeId ?: contentState?.adId,
+            contentState?.impressionId,
+            contentState?.creativeSource
+        )
+
         val shadowEvents = audienceAnalyzer?.getSensorCollector()?.getAndResetShadowEvents() ?: 0
 
         // --- Phase 3: Multi-signal confidence calibration ---
@@ -1884,7 +2243,11 @@ class AudienceSensingService(
         // calibrated confidence. This replaces the flat 0.95 parse confidence with
         // real P(observation correct | sensor data) measured by inter-signal agreement.
         val currentVlmOutputForCalibration = lastVlmOutput
-        val audioOccupancyNumeric = parseOccupancyToInt(estimatedOccupancy)
+        // Edge-side occupancy bucketing was deleted with cosmic-brewing-bear C1;
+        // the SignalBundle audioOccupancy slot is null until a replacement
+        // signal lands (e.g. crowd_voice_count_estimate when buyer-side
+        // calibration uses it).
+        val audioOccupancyNumeric: Int? = null
         val signalBundle = SignalBundle(
             faceCount = avgFaceCount.toInt(),
             personCount = avgPersonCount.toInt(),
@@ -1940,23 +2303,37 @@ class AudienceSensingService(
 
         val speechSignalsPresent = aggregatedSpeech?.hasBrandMentions() == true
             || aggregatedSpeech?.hasActionablePurchaseSignals() == true
+        // estimatedOccupancy is permanently null after cosmic-brewing-bear C1
+        // (the bucket strings are gone). Drop that branch from the proxy
+        // OR-chain — the remaining signals (person count, foot traffic, shadow
+        // events, speech) carry the load.
         val strongProxySignalsPresent = avgPersonCount >= 0.75
             || (footTrafficMetrics?.estimatedCount ?: 0) >= 2
             || shadowEvents > 0
             || speechSignalsPresent
-            || estimatedOccupancy !in setOf("0-5", "unknown")
-        val proxySignalsPresent = strongProxySignalsPresent || avgAdReceptivity >= 0.7
+        // avgAdReceptivity is now nullable; treat null as "below threshold".
+        val proxySignalsPresent = strongProxySignalsPresent || (avgAdReceptivity ?: 0.0) >= 0.7
         val diagnosticReason = if (avgFaceCount < 0.5 && strongProxySignalsPresent) {
             "proxy_signal_mismatch"
         } else {
             null
         }
 
+        // estimatedOccupancy=null on the wire — the magic-bucket strings
+        // ("0-5", "5-20", "20-50", "50+") are an audio-noise-tier proxy that
+        // misrepresents face-backed occupancy. Server's
+        // networkAggregationService overrides occupancy with String(totalViewers)
+        // when face count > 0; dropping the edge string lets the server's
+        // null-fallback path show "—" instead of a fake bucket. The internal
+        // FootTrafficEstimator heuristic above still consumes the
+        // edge-bucketed audio signal — that's edge-internal and doesn't reach
+        // the wire. Raw audio scalars (audio_db_max, crowd_voice_count_estimate,
+        // event_counts) are tracked under Task #7 in cosmic-brewing-bear.
         var edgeQualityTelemetry = buildEdgeQualityTelemetry(
             avgFaceCountWindow = avgFaceCount,
             avgPersonCountWindow = avgPersonCount,
             maxFaceCountWindow = maxFaceCount,
-            estimatedOccupancy = estimatedOccupancy,
+            estimatedOccupancy = null,
             speechSignalsPresent = speechSignalsPresent,
             proxySignalsPresent = proxySignalsPresent,
             proxySignalMismatch = diagnosticReason != null,
@@ -2011,7 +2388,14 @@ class AudienceSensingService(
             put("venue_id", venueId ?: JSONObject.NULL)
             put("inference_snapshot_id", inferenceSnapshotId)
             put("profile_id", activeProfileId ?: JSONObject.NULL)
-            put("vlm_runtime", currentVlmRuntimeTelemetry.toJson())
+            // Only emit vlm_runtime when the VLM is actively producing
+            // inference. Disabled/blocked/initializing/failed states are dead
+            // weight on the wire. Server consumer (normalizeVlmRuntimeTelemetry,
+            // audienceMetricsService.js#393) tolerates the field being
+            // absent — it falls back to `null`.
+            if (currentVlmRuntimeTelemetry.state == VlmRuntimeTelemetry.STATE_ACTIVE) {
+                put("vlm_runtime", currentVlmRuntimeTelemetry.toJson())
+            }
             appendObservationProgramMetadata(
                 target = this,
                 programSpecJson = activeProgramSpecJson,
@@ -2036,9 +2420,11 @@ class AudienceSensingService(
                 })
             }
             if (aggregatedSpeech != null) {
+                // purchase_intent emission removed in cosmic-brewing-bear
+                // task #26 — cloud Gemini's speech_purchase_intent enum is
+                // canonical (audienceVisionService.js#_assembleProfilePrompt).
                 modelOutputs.put("whisper_tiny", JSONObject().apply {
                     put("speaker_count", aggregatedSpeech.estimatedSpeakerCount)
-                    put("purchase_intent", aggregatedSpeech.purchaseIntent.name)
                     put("brand_mentions", aggregatedSpeech.brandMentions.size)
                 })
             }
@@ -2052,8 +2438,15 @@ class AudienceSensingService(
                 emotionalEngagement.pose?.let { pose ->
                     modelOutputs.put("movenet", JSONObject().apply {
                         put("body_engagement", pose.bodyEngagementScore)
-                        put("stopped_count", pose.stoppedCount)
-                        put("walking_past_count", pose.walkingPastCount)
+                        // Self-describing distribution — adding a new MovementState surfaces
+                        // through here automatically. Server reads keys directly off the map.
+                        put("movement_distribution", JSONObject().apply {
+                            pose.movementDistribution.forEach { (state, count) -> put(state.name, count) }
+                        })
+                        // Legacy convenience keys kept for one APK release while the server-side
+                        // reader migrates to the distribution map. Drop both in the next PR.
+                        put("stopped_count", pose.movementDistribution[MovementState.STOPPED] ?: 0)
+                        put("walking_past_count", pose.movementDistribution[MovementState.WALKING_FAST] ?: 0)
                     })
                 }
             }
@@ -2072,6 +2465,30 @@ class AudienceSensingService(
                     put("window_start_ms", currentCsiSnapshot.windowStartMs)
                     put("window_end_ms", currentCsiSnapshot.windowEndMs)
                     put("node_count", effectiveCsiNodeCount)
+                })
+            }
+            // efficientdet: vehicle + pedestrian counts from ObjectDetectionProcessor
+            // (Phase 4 wire-up). VehicleFlowProcessor and QueueEstimationProcessor
+            // accumulate per-frame snapshots and expose per-window aggregates here.
+            // These ride the existing 10s → audienceSignals → metricsWorker →
+            // audience_metrics path as model_outputs.efficientdet fields.
+            val vehicleMetrics = audienceAnalyzer?.getVehicleFlowMetrics()
+            val queueMetrics = audienceAnalyzer?.getQueueMetrics()
+            if (vehicleMetrics != null || queueMetrics != null) {
+                modelOutputs.put("efficientdet", JSONObject().apply {
+                    vehicleMetrics?.let { vm ->
+                        put("vehicle_count", vm.currentVehicleCount)
+                        put("avg_vehicle_count", vm.avgVehicleCount)
+                        put("peak_vehicle_count", vm.peakVehicleCount)
+                        put("fill_rate_estimate", vm.fillRateEstimate)
+                        put("vehicle_trend", vm.trend)
+                    }
+                    queueMetrics?.let { qm ->
+                        put("pedestrian_count", qm.estimatedQueueLength)
+                        put("queue_length", qm.estimatedQueueLength)
+                        put("queue_detected", qm.isQueueDetected)
+                        put("queue_trend", qm.trend)
+                    }
                 })
             }
             val ageGenderProc = audienceAnalyzer?.getAgeGenderProcessor()
@@ -2113,6 +2530,21 @@ class AudienceSensingService(
                 put("model_outputs", modelOutputs)
             }
 
+            // Phase 5d: forward cloud-computed dynamic fields (politeness_score etc.)
+            // from the most recent /v2/earner/audience-analyze response onto the
+            // 10s audienceSignals wire so analytics + WebSocket consumers see them.
+            // latestDemographics is set by onDemographicsReceived when the HTTP call
+            // returns (~every 30s); null between device boots or before first cloud call.
+            // profile_fields_timestamp lets downstream (metricsWorker, analytics) deduplicate
+            // repeated 10s emits that carry the same cloud analysis result — same timestamp
+            // = same cloud call, different timestamp = fresh analysis.
+            latestDemographics?.let { demographics ->
+                demographics.profileFields?.let { fields ->
+                    put("profile_fields", fields)
+                    put("profile_fields_timestamp", demographics.analysisTimestamp)
+                }
+            }
+
             // Face metrics (vision signals)
             put("avgFaceCount", avgFaceCount)
             put("avgPersonCount", avgPersonCount)
@@ -2124,9 +2556,26 @@ class AudienceSensingService(
             put("avgNoiseTier", avgNoiseTier)
             put("crowdedPct", crowdedPct)
             put("dominantAmbience", dominantAmbience)
-            put("estimatedOccupancy", estimatedOccupancy)
-            put("adReceptivityScore", avgAdReceptivity)
+            // estimatedOccupancy: null on the wire — the magic-bucket strings
+            // ("0-5"…"50+") were deleted in cosmic-brewing-bear C1; server
+            // resolves occupancy from face count via networkAggregationService.
+            // adReceptivityScore: now Double? — null when no audio data this
+            // window (cosmic-brewing-bear C2 deletes the `?: 0.5` fallback).
+            put("adReceptivityScore", avgAdReceptivity ?: JSONObject.NULL)
             put("inferredVenueType", inferredVenueType)
+
+            // Raw audio scalars (cosmic-brewing-bear C1) — buyer-grade
+            // honest signals replacing the deleted occupancy buckets.
+            // dBFS is digital full-scale (NOT calibrated SPL). Server reads
+            // these as deltas/relatives. Null when no audio window observed.
+            put("audio_db_max", audioDbMax?.toDouble() ?: JSONObject.NULL)
+            put("audio_db_mean", audioDbMean?.toDouble() ?: JSONObject.NULL)
+            put("crowd_voice_count_estimate", crowdVoiceCountEstimate ?: JSONObject.NULL)
+            // Empty map → emit empty object; downstream fanout treats absent
+            // and empty identically.
+            put("audio_class_event_counts", JSONObject().apply {
+                for ((cls, count) in audioClassEventCounts) put(cls, count)
+            })
 
             // Phase 4 PR 8: YAMNet per-class histogram (per-class counts in
             // 0.5s bins). Snapshot + reset is atomic under yamnetHistogramLock.
@@ -2193,7 +2642,8 @@ class AudienceSensingService(
                     put("shoppingContexts", JSONArray(aggregatedSpeech.shoppingContexts))
                     put("priceInquiry", aggregatedSpeech.priceInquiry)
                     put("availabilityInquiry", aggregatedSpeech.availabilityInquiry)
-                    put("purchaseIntent", aggregatedSpeech.purchaseIntent.name)
+                    // purchaseIntent removed — cloud Gemini emits the
+                    // canonical speech_purchase_intent enum.
                     put("purchaseJourney", JSONObject().apply {
                         put("stage", aggregatedSpeech.purchaseJourney.stage)
                         put("urgency", aggregatedSpeech.purchaseJourney.urgency)
@@ -2261,10 +2711,15 @@ class AudienceSensingService(
                 }
 
                 val pose = emotionalEngagement.pose
+                val moveCount = { state: MovementState -> pose?.movementDistribution?.get(state) ?: 0 }
+                val stopped = moveCount(MovementState.STOPPED)
+                val walking = moveCount(MovementState.WALKING_FAST)
+                val approaching = moveCount(MovementState.APPROACHING)
                 val movementPace = when {
-                    pose != null && pose.stoppedCount > pose.walkingPastCount -> "stationary"
-                    pose != null && pose.walkingPastCount > 0 && pose.approachingCount > 0 -> "strolling"
-                    pose != null && pose.walkingPastCount > pose.stoppedCount -> "hurrying"
+                    pose == null -> "strolling"
+                    stopped > walking -> "stationary"
+                    walking > 0 && approaching > 0 -> "strolling"
+                    walking > stopped -> "hurrying"
                     else -> "strolling"
                 }
 
@@ -2294,6 +2749,59 @@ class AudienceSensingService(
                 put("currentImpressionId", JSONObject.NULL)
             }
 
+            // Phase 1c — per-(face_track × ad_id) attention observations.
+            // Additive to the existing aggregate histograms (movement /
+            // emotion / gaze) — older payload consumers ignore the field;
+            // the new server-side consumer fans each row into
+            // observation_field_values with field_key
+            // 'per_face_obs_ad_<adId>_face_<faceId>_<dim>' for typed OFV
+            // access. The accumulator drains AND clears state; the next
+            // window starts fresh.
+            val perFaceDrain = audienceAnalyzer?.drainPerAdAttention() ?: emptyMap()
+            if (perFaceDrain.isNotEmpty()) {
+                val perFaceJson = JSONArray()
+                for ((adId, faceMap) in perFaceDrain) {
+                    // Source recorded at setCurrentAd time via the 3-arg
+                    // overload. Null for legacy windows where the JS bridge
+                    // didn't populate creativeSource (e.g. older WebView build).
+                    val creativeSource = audienceAnalyzer?.getSourceFor(adId)
+                    for ((faceTrackId, attention) in faceMap) {
+                        perFaceJson.put(JSONObject().apply {
+                            // `ad_id` kept for back-compat with cloud
+                            // consumers that key off the IMA programmatic
+                            // ad name. `creative_id` is the unified key
+                            // (== ad_id when source==ima_programmatic,
+                            // == stream item id otherwise).
+                            put("ad_id", adId)
+                            put("creative_id", adId)
+                            put("creative_source", creativeSource ?: JSONObject.NULL)
+                            put("face_track_id", faceTrackId)
+                            put("dwell_seconds", attention.dwellSecondsTotal.toDouble())
+                            put("gaze_seconds", attention.gazeSecondsTotal.toDouble())
+                            put("attention_p50", attention.attentionP50.toDouble())
+                            put("attention_max", attention.attentionMax.toDouble())
+                            put("dominant_emotion", attention.dominantEmotion.name)
+                            put("emotion_confidence_max", attention.emotionConfidenceMax.toDouble())
+                            put("gaze_pct_on_screen", attention.gazePctOnScreen.toDouble())
+                            put("primary_focus_region", attention.primaryFocusRegion)
+                            put("age_bucket", attention.ageBucket ?: JSONObject.NULL)
+                            put("gender", attention.gender ?: JSONObject.NULL)
+                            put("first_seen_ms", attention.firstSeenMs)
+                            put("last_seen_ms", attention.lastSeenMs)
+                            put("sample_count", attention.sampleCount)
+                        })
+                    }
+                }
+                put("per_face_observations", perFaceJson)
+                // Mirror onto the field FrameCaptureManager's HTTP POST will
+                // read. The snapshot lives until the NEXT drain replaces it,
+                // covering the gap between this 10-sec WS window and the
+                // 30-sec HTTP cadence. Worst case the HTTP body carries the
+                // previous window's per-face — acceptable since the cloud
+                // joins on observation_id (not time-aligned anyway).
+                latestPerFaceSnapshot = perFaceJson
+            }
+
             // On-device demographics (10s granularity, augments Gemini 5-min captures)
             // Skip if tier >= MEDIUM (age/gender processor unloaded).
             //
@@ -2304,9 +2812,29 @@ class AudienceSensingService(
             // (no onDeviceDemographics block). Honest null is the only
             // acceptable degraded state — the previous heuristic fallback
             // fabricated data and was removed in this PR.
-            if (currentTier == null || currentTier.ordinal < MemoryAttenuationManager.AttenuationTier.MEDIUM.ordinal) {
-                val ageGenderProcessor = audienceAnalyzer?.getAgeGenderProcessor()
-                if (ageGenderProcessor != null && ageGenderProcessor.hasFaces()) {
+            // PR 10 diagnostic — emit the 3 gate predicates independently so
+            // the next operator can tell from logcat WHY FaceXFormer isn't
+            // emitting demographics on a given device. Throttled to once per
+            // ~30s (3 emission windows) to avoid logcat flood. Symptom we are
+            // diagnosing: 0 of 857,819 audience_metrics rows in the last 7d
+            // had on_device_age_distribution populated.
+            val tierOk = currentTier == null || currentTier.ordinal < MemoryAttenuationManager.AttenuationTier.MEDIUM.ordinal
+            val gateAgeGenderProcessor = audienceAnalyzer?.getAgeGenderProcessor()
+            val processorPresent = gateAgeGenderProcessor != null
+            val hasFaces = gateAgeGenderProcessor?.hasFaces() ?: false
+            // Codex P2 (#5763): monotonic clock so NTP / timezone / manual time
+            // adjustments don't make `nowMs - lastAgeGenderDiagLogMs` jump
+            // negative (silent log starvation) or huge (log flood).
+            val nowMs = android.os.SystemClock.elapsedRealtime()
+            if (nowMs - lastAgeGenderDiagLogMs >= 30_000L) {
+                Log.d(TAG, "[AgeGender-Diag] tier=${currentTier?.name ?: "NORMAL"} " +
+                    "tierOk=$tierOk processorPresent=$processorPresent hasFaces=$hasFaces")
+                lastAgeGenderDiagLogMs = nowMs
+            }
+
+            if (tierOk) {
+                val ageGenderProcessor = gateAgeGenderProcessor
+                if (ageGenderProcessor != null && hasFaces) {
                     put("onDeviceDemographics", JSONObject().apply {
                         put("ageDistribution", ageGenderProcessor.getAgeDistribution())
                         put("genderSplit", ageGenderProcessor.getGenderSplit())
@@ -2320,20 +2848,20 @@ class AudienceSensingService(
                 // and on_device_gender_split remain NULL in CH for this row.
             }
 
-            // Creative zone attention heatmap
-            // Skip if tier >= HIGH (gaze processor unloaded)
+            // Creative zone attention heatmap (3×3 viewport grid).
+            // Skip if tier >= HIGH (FaceLandmarker unloaded under memory pressure).
             if (currentTier == null || currentTier.ordinal < MemoryAttenuationManager.AttenuationTier.HIGH.ordinal) {
-                val gazeProc = audienceAnalyzer?.getGazeProcessor()
-                if (gazeProc != null) {
-                    val zoneDistribution = gazeProc.getZoneDistribution()
+                val analyzer = audienceAnalyzer
+                if (analyzer != null && analyzer.isFaceLandmarkerActive()) {
+                    val zoneDistribution = analyzer.getGazeZoneDistribution()
                     if (zoneDistribution.isNotEmpty()) {
                         put("creativeZones", JSONObject().apply {
                             zoneDistribution.forEach { (zone, pct) ->
-                                put(GazeTrackingProcessor.zoneToLabel(zone), pct)
+                                put(GazeZoneLabels.zoneToLabel(zone), pct)
                             }
                         })
                     }
-                    gazeProc.resetZoneDwell()
+                    analyzer.resetZoneDwell()
                 }
             }
 
@@ -2406,13 +2934,6 @@ class AudienceSensingService(
                 payload.put("vasTimestamp", vasResult.signingTimestamp ?: JSONObject.NULL)
                 payload.put("bodyEngagementScore", bodyEng)
                 payload.put("focusRegion", focusReg)
-
-                // Accumulate gradients for federated learning
-                val emotionPreds = audienceAnalyzer?.getLastEmotionScores()
-                val emotionLabels = audienceAnalyzer?.getEmotionPseudoLabels()
-                if (emotionPreds != null && emotionLabels != null) {
-                    trainer.accumulateGradients("emotion_fer", emotionPreds, emotionLabels)
-                }
             } catch (vasErr: Exception) {
                 Log.w(TAG, "[VAS] Computation failed (non-fatal): ${vasErr.message}")
             }
@@ -2443,7 +2964,9 @@ class AudienceSensingService(
                     "dominant_emotion" to (emotionalEngagement?.emotion?.dominantEmotion?.name),
                     "engagement_score" to (emotionalEngagement?.overallEngagementScore?.toDouble()),
                     "body_engagement" to (emotionalEngagement?.pose?.bodyEngagementScore?.toDouble()),
-                    "purchase_intent" to (aggregatedSpeech?.purchaseIntent?.name),
+                    // "purchase_intent" removed — cloud Gemini emits the
+                    // canonical signal; clip triggers can read it from the
+                    // post-merge audience_metrics row server-side.
                     "speaker_count" to (aggregatedSpeech?.estimatedSpeakerCount),
                     "brand_mentions" to (aggregatedSpeech?.brandMentions?.size),
                 )
@@ -2491,7 +3014,7 @@ class AudienceSensingService(
         // Log summary
         val speechSummary = if (aggregatedSpeech != null && aggregatedSpeech.confidence > 0) {
             val shoppingContexts = aggregatedSpeech.shoppingContexts.take(2).joinToString("|").ifBlank { "none" }
-            "speech=${aggregatedSpeech.purchaseIntent.name}/${aggregatedSpeech.brandMentions.size}brands/stage=${aggregatedSpeech.purchaseJourney.stage}/contexts=$shoppingContexts"
+            "speech=${aggregatedSpeech.brandMentions.size}brands/stage=${aggregatedSpeech.purchaseJourney.stage}/contexts=$shoppingContexts"
         } else "speech=none"
 
         Log.d(TAG, "[Aggregation] EmotionalEngagement: " +
@@ -2511,7 +3034,7 @@ class AudienceSensingService(
                 "maxFaces=$maxFaceCount, " +
                 "attention=${String.format("%.2f", avgAttention)}, " +
                 "ambience=$dominantAmbience, " +
-                "receptivity=${String.format("%.2f", avgAdReceptivity)}, " +
+                "receptivity=${avgAdReceptivity?.let { String.format("%.2f", it) } ?: "n/a"}, " +
                 "$speechSummary, $emotionalSummary")
     }
 
@@ -2528,8 +3051,9 @@ class AudienceSensingService(
         val allObjections = snapshots.flatMap { it.objections }.distinct()
         val allInterests = snapshots.flatMap { it.interests }.distinct()
 
-        // Take the strongest purchase intent
-        val strongestIntent = snapshots.maxOfOrNull { it.purchaseIntent } ?: PurchaseIntent.NONE
+        // strongestIntent aggregation removed — SpeechInsights.purchaseIntent
+        // was deleted in cosmic-brewing-bear task #26 (cloud Gemini emits
+        // the canonical enum).
 
         // Any price or availability inquiry in the window
         val anyPriceInquiry = snapshots.any { it.priceInquiry }
@@ -2568,7 +3092,6 @@ class AudienceSensingService(
             shoppingContexts = snapshots.flatMap { it.shoppingContexts }.distinct(),
             priceInquiry = anyPriceInquiry,
             availabilityInquiry = anyAvailabilityInquiry,
-            purchaseIntent = strongestIntent,
             purchaseJourney = mergedPurchaseJourney,
             mentionedBuyingToday = anyBuyingToday,
             objections = allObjections,
@@ -2732,7 +3255,7 @@ class AudienceSensingService(
         }
         Log.i(
             TAG,
-            "[Speech][Debug] Injected structured speech - intent=${insights.purchaseIntent.name}, " +
+            "[Speech][Debug] Injected structured speech - " +
                 "stage=${insights.purchaseJourney.stage}, contexts=${insights.shoppingContexts.joinToString("|")}"
         )
         aggregateAndEmit()
@@ -2827,7 +3350,7 @@ class AudienceSensingService(
      */
     fun rebindCamera(lifecycleOwner: LifecycleOwner) {
         if (!isRunning) {
-            Log.d(TAG, "[Service] Not running, cannot rebind camera")
+            Log.w(TAG, "[Service] rebindCamera requested while stopped — recovery should call restartAudienceSensing, not rebind")
             return
         }
 
@@ -2843,7 +3366,7 @@ class AudienceSensingService(
      */
     fun rebindAudio() {
         if (!isRunning) {
-            Log.d(TAG, "[Service] Not running, cannot rebind audio")
+            Log.w(TAG, "[Service] rebindAudio requested while stopped — recovery should call restartAudienceSensing, not rebind")
             return
         }
 
@@ -2926,9 +3449,17 @@ class AudienceSensingService(
     /**
      * Set the content state provider for ad-audience correlation.
      * Called by tablet-agent to provide current content state (which ad is playing).
+     *
+     * Phase 1b: also forward to FrameCaptureManager so the JPEG REST payload
+     * carries currentAdId / currentImpressionId. Provider injection may happen
+     * before OR after initializeFrameCapture — handle both orderings.
      */
     fun setContentStateProvider(provider: ContentStateProvider) {
         contentStateProvider = provider
+        // Race-safe forwarding: if frame capture is already up, push the
+        // provider through; if not, initializeFrameCapture will pick it up
+        // from this.contentStateProvider when it runs.
+        frameCaptureManager?.contentStateProvider = provider
         Log.i(TAG, "Content state provider set")
     }
 
@@ -2972,10 +3503,20 @@ class AudienceSensingService(
     @Volatile private var activeProgramSpecVersion: String? = null
     @Volatile private var activeProgramRuntimeContract: ObservationProgramRuntimeContract? = null
     @Volatile private var activeVlmRuntimeTelemetry: VlmRuntimeTelemetry = VlmRuntimeTelemetry()
+    // Raw JSON array string of `program_spec.observation_program.signals` from the
+    // active profile. Fed to OnDeviceLlmInsightExtractor at (re)init time so it
+    // builds its OpenApiTool spec from the profile's declared speech fields.
+    @Volatile private var activeSignalsJson: String? = null
 
     /** Set the VLM prompt for the active profile (called before applyProfileToInference). */
     fun setVlmPrompt(prompt: String?) {
         activeVlmPrompt = prompt
+    }
+
+    /** Set the signals[] JSON array from the active profile's program_spec.observation_program.
+     *  Used by [OnDeviceLlmInsightExtractor] to build its OpenApiTool spec at runtime. */
+    fun setActiveSignalsJson(signalsJson: String?) {
+        activeSignalsJson = signalsJson
     }
 
     /** Preserve observation-program metadata for downstream payload compatibility. */
@@ -3099,11 +3640,14 @@ class AudienceSensingService(
      * Model ID to processor mapping:
      * - blazeface -> AudienceAnalyzer (ML Kit face detection, always-on core)
      * - age_gender -> AgeGenderProcessor (on-device demographics)
-     * - fer_plus -> EmotionClassificationProcessor (FER TFLite)
+     * - fer_plus -> FaceLandmarkerProcessor (MediaPipe blendshape-derived emotion;
+     *                wire-format model_id retained for API compatibility)
      * - movenet -> PoseEngagementProcessor (MediaPipe Pose)
      * - yamnet -> AudioClassificationProcessor (ambient audio)
      * - whisper_tiny -> SpeechIntelligenceProcessor (Moonshine ASR)
      * - efficientdet -> PersonDetectionProcessor (TFLite person detection)
+     *                   + ObjectDetectionProcessor → VehicleFlowProcessor + QueueEstimationProcessor
+     *                   (vehicle_count, pedestrian_count — Phase 4 wire-up)
      *
      * This method is safe to call multiple times; it updates state in-place.
      */
@@ -3216,7 +3760,7 @@ class AudienceSensingService(
         Log.i(TAG, "[Profile] Vision sub-models active: ${selection.activeModelIds()}")
 
         // VLM model activation/deactivation
-        val vlmModelIds = setOf("gemma_3n_e2b", "gemma_4_e2b", "moondream_05b", "smolvlm_256m")
+        val vlmModelIds = setOf("gemma_4_e2b", "moondream_05b", "smolvlm_256m")
         val wantedVlmId = when {
             temporalWorker != null && !temporalWorker.enabled -> null
             temporalWorker?.modelIds?.isNotEmpty() == true -> temporalWorker.modelIds.firstOrNull { it in vlmModelIds }
@@ -3769,12 +4313,12 @@ class AudienceSensingService(
     /**
      * Update the dynamic brand list for speech intelligence.
      * Called when the server sends active campaign brands for this screen.
-     * Routes to both SpeechIntelligenceProcessor and InsightExtractor.
+     * Brand awareness is now operator-declared via profile signals; this is a no-op
+     * retained for call-site compatibility until callers are removed.
      */
     fun updateBrandList(brands: List<String>) {
-        speechProcessor?.setDynamicBrands(brands)
-        InsightExtractor.setDynamicBrands(brands)
-        Log.i(TAG, "Dynamic brand list updated: ${brands.size} brands")
+        Log.i(TAG, "Dynamic brand list received (${brands.size} brands) — " +
+            "brand awareness is profile-driven; no-op on device side")
     }
 
     /**
@@ -3855,13 +4399,26 @@ class AudienceSensingService(
         // (state→OPEN flips shouldDevolveFaceCap back to false).
         val faceCapHonest = !shouldDevolveFaceCap()
 
+        // Belt-and-suspenders for server-side cap_face_detection / cap_audio_classification
+        // derivation (peppy-cooking-blum PR 1). Mirror the server's logic so a single
+        // boolean read replaces the cameraAvailable+sensingMode tuple. faceDetection
+        // honors the `faceCapHonest` devolution so a camera FAILED >24h stops claiming
+        // the capability — matches what the existing `cameraAvailable` line does.
+        val effectiveCameraAvailable = cameraStatus.available && faceCapHonest
+        val effectiveMicAvailable = hasMicrophoneHardware && hasMicrophonePermission
+        val sensingModeName = _currentState.value.mode.name
+        val faceDetection = effectiveCameraAvailable && (sensingModeName == SensingMode.FACE_ONLY.name || sensingModeName == SensingMode.FULL.name)
+        val audioClassification = effectiveMicAvailable && (sensingModeName == SensingMode.AUDIO_ONLY.name || sensingModeName == SensingMode.FULL.name)
+
         return com.trillboards.ctv.core.models.DeviceCapabilityPayload.AudienceSensing(
-            cameraAvailable = cameraStatus.available && faceCapHonest,
+            cameraAvailable = effectiveCameraAvailable,
             cameraType = cameraStatus.type,
             cameraCount = cameraStatus.count,
-            microphoneAvailable = hasMicrophoneHardware && hasMicrophonePermission,
-            sensingMode = _currentState.value.mode.name,
-            cameraHealth = cameraHealth
+            microphoneAvailable = effectiveMicAvailable,
+            sensingMode = sensingModeName,
+            cameraHealth = cameraHealth,
+            faceDetection = faceDetection,
+            audioClassification = audioClassification
         )
     }
 
@@ -4066,9 +4623,9 @@ class AudienceSensingService(
         val runtimeContract = activeProgramRuntimeContract
         val wantsVlm = if (runtimeContract?.temporalSemantics != null) {
             runtimeContract.temporalSemantics.enabled &&
-                runtimeContract.temporalSemantics.modelIds.any { it == "gemma_3n_e2b" || it == "gemma_4_e2b" }
+                runtimeContract.temporalSemantics.modelIds.any { it == "gemma_4_e2b" }
         } else {
-            currentModels.any { it == "gemma_3n_e2b" || it == "gemma_4_e2b" }
+            currentModels.any { it == "gemma_4_e2b" }
         }
         if (!wantsVlm || vlmProcessor != null) {
             return

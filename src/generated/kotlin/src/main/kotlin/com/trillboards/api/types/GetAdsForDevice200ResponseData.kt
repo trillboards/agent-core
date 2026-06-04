@@ -17,6 +17,7 @@ package com.trillboards.api.types
 
 import com.trillboards.api.types.Ad
 import com.trillboards.api.types.AdSettings
+import com.trillboards.api.types.AdsEndpointUnificationTelemetry
 import com.trillboards.api.types.GetAdsForDevice200ResponseDataDevice
 import com.trillboards.api.types.GetAdsForDevice200ResponseDataScreenDimensions
 import com.trillboards.api.types.HeaderBiddingSettings
@@ -29,6 +30,7 @@ import kotlinx.serialization.Contextual
  * 
  *
  * @param ads 
+ * @param adsEndpointUnification 
  * @param cacheUntil 
  * @param device 
  * @param headerBiddingSettings 
@@ -43,6 +45,9 @@ data class GetAdsForDevice200ResponseData (
 
     @SerialName(value = "ads")
     val ads: kotlin.collections.List<Ad>? = null,
+
+    @SerialName(value = "ads_endpoint_unification")
+    val adsEndpointUnification: AdsEndpointUnificationTelemetry? = null,
 
     @SerialName(value = "cache_until")
     val cacheUntil: kotlin.String? = null,

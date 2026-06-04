@@ -82,13 +82,24 @@ interface VLMEngine {
  *   When set, engines use this instead of their default system instruction.
  *   Currently used by direct engine callers; VLMInferenceProcessor passes
  *   the server-generated metricsPrompt via buildPrompt() in the user message.
+ * @param toolsJsonSchema Optional JSON Schema string for an [OpenApiTool] to inject
+ *   into the [ConversationConfig]. When non-null the engine creates one tool named
+ *   "EmitSpeechInsights" with this schema and passes [automaticToolCalling] to
+ *   control whether the SDK invokes the tool automatically. Defaults preserve the
+ *   existing [gemma_4_e2b] VLM path (schema=null, automaticToolCalling=true).
+ * @param automaticToolCalling When [toolsJsonSchema] is non-null, controls whether
+ *   the SDK auto-invokes the tool (true) or returns the raw tool-call JSON in the
+ *   response text (false). For [OnDeviceLlmInsightExtractor] use false so the JSON
+ *   is available for parsing. Has no effect when [toolsJsonSchema] is null.
  */
 data class VLMConfig(
     val maxTokens: Int = SensingConfig.get().vlm.maxTokens,
     val temperature: Float = SensingConfig.get().vlm.temperature,
     val useGpu: Boolean = true,
     val numThreads: Int = SensingConfig.get().vlm.numThreads,
-    val systemPrompt: String? = null
+    val systemPrompt: String? = null,
+    val toolsJsonSchema: String? = null,
+    val automaticToolCalling: Boolean = true
 )
 
 /**

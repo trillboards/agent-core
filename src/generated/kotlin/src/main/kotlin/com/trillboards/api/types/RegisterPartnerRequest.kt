@@ -28,7 +28,7 @@ import kotlinx.serialization.Contextual
  * @param slug URL-safe identifier (lowercase, no spaces)
  * @param allowedDomains Whitelist of allowed referrer domains
  * @param contactName 
- * @param partnerType 
+ * @param partnerType Optional legacy classification. Omit this field for the default self-serve Partner API key. Existing integrations may continue sending historical values. Use `ctv_publisher` only when Trillboards has explicitly provisioned a managed CTV Measurement integration for your account. 
  * @param revenueSharePercent Partner's revenue share percentage (negotiated per partner)
  */
 @Serializable
@@ -53,7 +53,9 @@ data class RegisterPartnerRequest (
     @SerialName(value = "contact_name")
     val contactName: kotlin.String? = null,
 
+    /* Optional legacy classification. Omit this field for the default self-serve Partner API key. Existing integrations may continue sending historical values. Use `ctv_publisher` only when Trillboards has explicitly provisioned a managed CTV Measurement integration for your account.  */
     @SerialName(value = "partner_type")
+    @Deprecated(message = "This property is deprecated.")
     val partnerType: RegisterPartnerRequest.PartnerType? = PartnerType.OTHER,
 
     /* Partner's revenue share percentage (negotiated per partner) */
@@ -63,9 +65,9 @@ data class RegisterPartnerRequest (
 ) {
 
     /**
-     * 
+     * Optional legacy classification. Omit this field for the default self-serve Partner API key. Existing integrations may continue sending historical values. Use `ctv_publisher` only when Trillboards has explicitly provisioned a managed CTV Measurement integration for your account. 
      *
-     * Values: VENDING_MACHINE,KIOSK,DIGITAL_SIGNAGE,RETAIL_DISPLAY,OTHER
+     * Values: VENDING_MACHINE,KIOSK,DIGITAL_SIGNAGE,RETAIL_DISPLAY,CTV_PUBLISHER,OTHER
      */
     @Serializable
     enum class PartnerType(val value: kotlin.String) {
@@ -73,6 +75,7 @@ data class RegisterPartnerRequest (
         @SerialName(value = "kiosk") KIOSK("kiosk"),
         @SerialName(value = "digital_signage") DIGITAL_SIGNAGE("digital_signage"),
         @SerialName(value = "retail_display") RETAIL_DISPLAY("retail_display"),
+        @SerialName(value = "ctv_publisher") CTV_PUBLISHER("ctv_publisher"),
         @SerialName(value = "other") OTHER("other");
     }
 

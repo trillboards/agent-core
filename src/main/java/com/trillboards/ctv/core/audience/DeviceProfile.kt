@@ -599,4 +599,70 @@ object DeviceProfile {
         cachedProfile = null
         cachedCapabilityMatrix = null
     }
+
+    /**
+     * Predicate: does this device have separate (non-combo) Bluetooth and WiFi
+     * radios? This gates `SCAN_MODE_LOW_LATENCY` BLE scanning in
+     * `BleBeaconScanner` — devices with combo radios (single chip shared
+     * between BT + WiFi) can experience WiFi-throughput degradation when BT
+     * scans at LOW_LATENCY duty cycle, so they stay on LOW_POWER.
+     *
+     * Allow-list approach. Known-good split-radio designs in the Trillboards
+     * fleet:
+     *   - Rockchip RK3588 (TIER_1): external WiFi module on a separate die.
+     *   - Qualcomm flagship (sm7/sm8/sdm7/sdm8): FastConnect 6900/7800 with
+     *     dedicated BT+WiFi cores.
+     *   - Exynos 2200+ TIER_1/TIER_2: Broadcom BCM4389/BCM4398 split cores.
+     *   - MediaTek Dimensity 9xxx flagship (mt6989 / mt6991 / mt6993): MT79xx
+     *     WiFi companion chip on a separate die. Samsung Galaxy Tab S11
+     *     (Build.HARDWARE = mt6991, board = gts11wifi) lands here. Verified
+     *     2026-05-23 on live ADB — the Tab S11 is MediaTek-based despite the
+     *     planning doc's earlier assumption it was Exynos.
+     *
+     * Anything not in the allowlist (mid/budget MediaTek combo radios,
+     * Amlogic Fire TV combo radios, UNKNOWN, TIER_3/TIER_4 devices) defaults
+     * to false — keep LOW_POWER. This is the conservative safe choice from
+     * the plan: "If the DeviceCapability check is uncertain, default to
+     * LOW_POWER to avoid regression."
+     */
+    fun hasSeparateBtWifiRadios(matrix: DeviceCapabilityMatrix): Boolean {
+        // Only TIER_1 + TIER_2 devices get LOW_LATENCY — TIER_3/TIER_4 are
+        // memory-constrained budget devices, almost universally combo radios.
+        if (matrix.tier != CapabilityTier.TIER_1 && matrix.tier != CapabilityTier.TIER_2) {
+            return false
+        }
+        return when (matrix.chipsetVendor) {
+            // Rockchip RK3588 (TIER_1 only) — external WiFi module, split design.
+            ChipsetVendor.ROCKCHIP -> matrix.tier == CapabilityTier.TIER_1
+            // Qualcomm flagship FastConnect chips on the high-end Snapdragon
+            // SoCs — known split BT + WiFi cores. `chipsetName` is the lower-
+            // cased Build.HARDWARE string; the regex helper accepts it for
+            // both the hardware and board arguments since we only have one
+            // source string at this layer.
+            ChipsetVendor.QUALCOMM -> isQualcommHighEnd(matrix.chipsetName, matrix.chipsetName)
+            // Exynos 2200+ (recent Samsung phones) use Broadcom BCM4389 /
+            // BCM4398 — split BT + WiFi cores.
+            ChipsetVendor.EXYNOS -> true
+            // MediaTek Dimensity 9xxx flagships (mt6989 / mt6991 / mt6993)
+            // ship with MT79xx WiFi companion chips — split radio. Mid/budget
+            // MediaTek (Helio, lower Dimensity) stays combo, conservative.
+            ChipsetVendor.MEDIATEK -> isMediaTekFlagship(matrix.chipsetName)
+            // Amlogic + Unknown vendors: combo radios are the documented
+            // default — conservative LOW_POWER.
+            ChipsetVendor.AMLOGIC,
+            ChipsetVendor.UNKNOWN -> false
+        }
+    }
+
+    /**
+     * Predicate: MediaTek Dimensity 9xxx flagship SoCs that ship with split
+     * BT + WiFi radios (MT79xx companion chip on a separate die). The
+     * `mt6989` / `mt6991` / `mt6993` family numbers map to Dimensity 9300 /
+     * 9400+ / 9500 respectively. Older Helio + lower-Dimensity SKUs stay
+     * combo-radio and fall through to false.
+     */
+    private fun isMediaTekFlagship(hardware: String): Boolean {
+        val h = hardware.lowercase()
+        return h.contains("mt6989") || h.contains("mt6991") || h.contains("mt6993")
+    }
 }

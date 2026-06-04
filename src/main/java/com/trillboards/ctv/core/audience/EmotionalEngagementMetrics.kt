@@ -41,7 +41,14 @@ data class PoseMetrics(
     val bodyEngagementScore: Float = 0f,       // 0.0 to 1.0
 
     // Detection confidence
-    val confidence: Float = 0f
+    val confidence: Float = 0f,
+
+    // Phase 1c — Stable ML Kit face track ID this pose belongs to. Pose is
+    // body-level (not per-face), but when a single dominant face is bound
+    // PoseEngagementProcessor outputs can flow into the per-(face × ad)
+    // accumulator. Null when no face was bound (legacy path OR pose
+    // detected without a clear face).
+    val faceId: Int? = null
 )
 
 /**
@@ -85,10 +92,13 @@ data class AggregatedPoseMetrics(
     val leaningBackCount: Int = 0,
     val avgLeanMagnitude: Float = 0f,
 
-    // Movement aggregates
-    val stoppedCount: Int = 0,                  // Count of people who stopped
-    val walkingPastCount: Int = 0,              // Count of people walking past
-    val approachingCount: Int = 0,              // Count of people approaching
+    // Movement aggregates — every MovementState enum value carries its own count
+    // via a single Map so adding a new state (e.g. depth-aware APPROACHING /
+    // DEPARTING when pose-tracking gains depth) requires only updating the enum,
+    // never this data class or downstream consumers. Older code had 3 separate
+    // Int fields and silently dropped WALKING_SLOW between them — exactly the kind
+    // of leaky enum-as-N-fields shape that the Map representation eliminates.
+    val movementDistribution: Map<MovementState, Int> = emptyMap(),
     val avgMovementSpeed: Float = 0f,
 
     // Overall body engagement score
@@ -99,9 +109,9 @@ data class AggregatedPoseMetrics(
         put("facingScreenPct", facingScreenPct.sanitize())
         put("leaningInCount", leaningInCount)
         put("leaningBackCount", leaningBackCount)
-        put("stoppedCount", stoppedCount)
-        put("walkingPastCount", walkingPastCount)
-        put("approachingCount", approachingCount)
+        put("movementDistribution", JSONObject().apply {
+            movementDistribution.forEach { (state, count) -> put(state.name, count) }
+        })
         put("bodyEngagementScore", bodyEngagementScore.sanitize())
     }
 
@@ -138,7 +148,14 @@ data class EmotionMetrics(
     val emotionalEngagementScore: Float = 0f,   // 0.0 to 1.0 (neutral = 0, strong emotion = 1)
 
     // Detection confidence
-    val confidence: Float = 0f
+    val confidence: Float = 0f,
+
+    // Phase 1c — Stable ML Kit face track ID this emotion sample belongs to.
+    // Bound from the FaceLandmarker output via box-IoU match against the
+    // ML Kit faces list (AudienceAnalyzer:1547 — the first of four collapse
+    // points fixed in P1c). Null on the legacy fallback path where the
+    // FaceLandmarker output cannot be matched to an ML Kit face.
+    val faceId: Int? = null
 )
 
 /**
@@ -234,7 +251,12 @@ data class GazeMetrics(
     val attentionScore: Float = 0f,             // 0.0 to 1.0
 
     // Detection confidence
-    val confidence: Float = 0f
+    val confidence: Float = 0f,
+
+    // Phase 1c — Stable ML Kit face track ID. Bound from the FaceLandmarker
+    // output via box-IoU match against ML Kit's tracked faces (the same
+    // findOverlappingFace at AudienceAnalyzer:1889 that the dedup uses).
+    val faceId: Int? = null
 )
 
 /**
@@ -360,4 +382,139 @@ data class EmotionalEngagementConfig(
     val poseWeight: Float get() = SensingConfig.get().engagement.poseWeight
     val emotionWeight: Float get() = SensingConfig.get().engagement.emotionWeight
     val gazeWeight: Float get() = SensingConfig.get().engagement.gazeWeight
+}
+
+// =========================================================================
+// PHASE 1c — PER-(FACE × AD) ATTENTION ACCUMULATOR
+// =========================================================================
+
+/**
+ * Per-(face_track_id × ad_id) attention accumulator state.
+ *
+ * Phase 1c (FEIN) — eliminates the four collapse points where per-face
+ * structure is discarded before the cloud sees anything:
+ *
+ *   1. AudienceAnalyzer:1547 — FaceLandmarker emotions zipped by list-index
+ *      (now bound by faceId via box-IoU match)
+ *   2. AudienceAnalyzer:1714 — pose movement histogram bucketing
+ *   3. AudienceSensingService:2104-2110 — blazeface scalar averages
+ *   4. AgeGenderProcessor:410-419 — per-face age/gender histogram bins
+ *
+ * Each `PerFaceAttention` instance accumulates over a window for ONE
+ * (adId, faceTrackId) pair. At window flush time (AGGREGATION_WINDOW_MS)
+ * the AudienceAnalyzer drains the map and AudienceSensingService packs the
+ * result into `audienceSignals.per_face_observations[]` for emission.
+ *
+ * The accumulator is purely additive — it produces a new wire field but
+ * never replaces existing histogram fields. Older edge APKs (without P1c)
+ * continue to emit aggregate histograms; the server treats
+ * `per_face_observations` as optional and falls back to the histogram path
+ * when absent.
+ */
+data class PerFaceAttention(
+    // Per-face dwell and gaze accumulation (seconds, summed over window)
+    var dwellSecondsTotal: Float = 0f,
+    var gazeSecondsTotal: Float = 0f,
+    // Attention score distribution (p50 = median; max = window-max)
+    var attentionP50: Float = 0f,
+    var attentionMax: Float = 0f,
+    // Emotion state — dominant_emotion is the modal label across the window,
+    // emotion_confidence_max is the strongest single-sample confidence.
+    var dominantEmotion: EmotionType = EmotionType.UNKNOWN,
+    var emotionConfidenceMax: Float = 0f,
+    // Gaze-on-screen percentage over the window (0..1)
+    var gazePctOnScreen: Float = 0f,
+    // Primary 3x3 focus region (0..8, center=4) — modal across samples
+    var primaryFocusRegion: Int = 4,
+    // Optional demographics (only when on-device FaceXFormer ran AND the
+    // face was tracked across enough samples; null otherwise)
+    var ageBucket: String? = null,
+    var gender: String? = null,
+    // Track lifetime within the window
+    var firstSeenMs: Long = 0L,
+    var lastSeenMs: Long = 0L,
+    // Sample counter exposed for tests / observability
+    var sampleCount: Int = 0,
+) {
+    // Internal accumulators (private — finalize() consumes them into the
+    // emitted fields above). Kept outside the primary constructor so the
+    // data class shape remains "what gets emitted on the wire".
+    private val attentionSamples: MutableList<Float> = mutableListOf()
+    private val emotionCounts: MutableMap<EmotionType, Int> = mutableMapOf()
+    private val focusRegionCounts: IntArray = IntArray(9)
+    private var gazeOnScreenSamples: Int = 0
+    private var gazeTotalSamples: Int = 0
+
+    /**
+     * Accumulate a single per-face frame sample into this bucket.
+     *
+     * Called every frame the (adId, faceId) pair is observed. Updates
+     * running counts; the final percentile / mode / max are computed on
+     * drain via [finalize].
+     */
+    fun addSample(
+        nowMs: Long,
+        attentionScore: Float,
+        gazeAttentionScore: Float,
+        isLookingAtScreen: Boolean,
+        focusRegion: Int,
+        emotion: EmotionType,
+        emotionConfidence: Float,
+        frameIntervalMs: Long,
+    ) {
+        if (firstSeenMs == 0L) firstSeenMs = nowMs
+        lastSeenMs = nowMs
+        sampleCount += 1
+
+        // Dwell = total time this face was tracked in this bucket (every
+        // sample contributes its frame interval).
+        dwellSecondsTotal += frameIntervalMs / 1000f
+
+        // Gaze-on-screen seconds = time where isLookingAtScreen was true.
+        if (isLookingAtScreen) {
+            gazeSecondsTotal += frameIntervalMs / 1000f
+            gazeOnScreenSamples += 1
+        }
+        gazeTotalSamples += 1
+
+        attentionSamples.add(attentionScore)
+        if (attentionScore > attentionMax) attentionMax = attentionScore
+
+        if (emotion != EmotionType.UNKNOWN) {
+            emotionCounts[emotion] = (emotionCounts[emotion] ?: 0) + 1
+        }
+        if (emotionConfidence > emotionConfidenceMax) emotionConfidenceMax = emotionConfidence
+
+        if (focusRegion in 0..8) {
+            focusRegionCounts[focusRegion] += 1
+        }
+    }
+
+    /**
+     * Finalize the bucket — compute p50 / mode / pct fields from
+     * accumulated samples. Idempotent; safe to call multiple times.
+     * Returns this for fluent use.
+     */
+    fun finalize(): PerFaceAttention {
+        if (attentionSamples.isNotEmpty()) {
+            val sorted = attentionSamples.sorted()
+            attentionP50 = sorted[sorted.size / 2]
+        }
+        if (emotionCounts.isNotEmpty()) {
+            dominantEmotion = emotionCounts.maxByOrNull { it.value }?.key ?: EmotionType.UNKNOWN
+        }
+        var maxIdx = 4
+        var maxCount = -1
+        for (i in 0..8) {
+            if (focusRegionCounts[i] > maxCount) {
+                maxCount = focusRegionCounts[i]
+                maxIdx = i
+            }
+        }
+        primaryFocusRegion = maxIdx
+        gazePctOnScreen = if (gazeTotalSamples > 0) {
+            gazeOnScreenSamples.toFloat() / gazeTotalSamples.toFloat()
+        } else 0f
+        return this
+    }
 }

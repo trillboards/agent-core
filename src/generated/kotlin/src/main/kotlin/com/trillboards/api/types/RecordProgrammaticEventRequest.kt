@@ -25,6 +25,9 @@ import kotlinx.serialization.Contextual
  *
  * @param event 
  * @param adId 
+ * @param adsEndpointUnification Variant assigned by `/device/{deviceId}/ads`; SDKs echo this for proof-of-play/revenue canary analysis.
+ * @param adsEndpointUnificationEffectiveVariant Effective served variant after traffic/partner/device fuses; used for revenue readout.
+ * @param adsEndpointUnificationMode Runtime unification mode from `/device/{deviceId}/ads`.
  * @param errorCode 
  * @param errorMessage 
  * @param reason 
@@ -43,6 +46,18 @@ data class RecordProgrammaticEventRequest (
 
     @SerialName(value = "ad_id")
     val adId: kotlin.String? = null,
+
+    /* Variant assigned by `/device/{deviceId}/ads`; SDKs echo this for proof-of-play/revenue canary analysis. */
+    @SerialName(value = "ads_endpoint_unification")
+    val adsEndpointUnification: RecordProgrammaticEventRequest.AdsEndpointUnification? = null,
+
+    /* Effective served variant after traffic/partner/device fuses; used for revenue readout. */
+    @SerialName(value = "ads_endpoint_unification_effective_variant")
+    val adsEndpointUnificationEffectiveVariant: RecordProgrammaticEventRequest.AdsEndpointUnificationEffectiveVariant? = null,
+
+    /* Runtime unification mode from `/device/{deviceId}/ads`. */
+    @SerialName(value = "ads_endpoint_unification_mode")
+    val adsEndpointUnificationMode: RecordProgrammaticEventRequest.AdsEndpointUnificationMode? = null,
 
     @SerialName(value = "error_code")
     val errorCode: kotlin.String? = null,
@@ -81,6 +96,39 @@ data class RecordProgrammaticEventRequest (
         @SerialName(value = "ad_ended") AD_ENDED("ad_ended"),
         @SerialName(value = "no_fill") NO_FILL("no_fill"),
         @SerialName(value = "error") ERROR("error");
+    }
+    /**
+     * Variant assigned by `/device/{deviceId}/ads`; SDKs echo this for proof-of-play/revenue canary analysis.
+     *
+     * Values: CONTROL,UNIFIED_ADS_SHADOW,UNIFIED_ADS_SERVE
+     */
+    @Serializable
+    enum class AdsEndpointUnification(val value: kotlin.String) {
+        @SerialName(value = "control") CONTROL("control"),
+        @SerialName(value = "unified_ads_shadow") UNIFIED_ADS_SHADOW("unified_ads_shadow"),
+        @SerialName(value = "unified_ads_serve") UNIFIED_ADS_SERVE("unified_ads_serve");
+    }
+    /**
+     * Effective served variant after traffic/partner/device fuses; used for revenue readout.
+     *
+     * Values: CONTROL,UNIFIED_ADS_SHADOW,UNIFIED_ADS_SERVE
+     */
+    @Serializable
+    enum class AdsEndpointUnificationEffectiveVariant(val value: kotlin.String) {
+        @SerialName(value = "control") CONTROL("control"),
+        @SerialName(value = "unified_ads_shadow") UNIFIED_ADS_SHADOW("unified_ads_shadow"),
+        @SerialName(value = "unified_ads_serve") UNIFIED_ADS_SERVE("unified_ads_serve");
+    }
+    /**
+     * Runtime unification mode from `/device/{deviceId}/ads`.
+     *
+     * Values: OFF,SHADOW,SERVE
+     */
+    @Serializable
+    enum class AdsEndpointUnificationMode(val value: kotlin.String) {
+        @SerialName(value = "off") OFF("off"),
+        @SerialName(value = "shadow") SHADOW("shadow"),
+        @SerialName(value = "serve") SERVE("serve");
     }
     /**
      * 

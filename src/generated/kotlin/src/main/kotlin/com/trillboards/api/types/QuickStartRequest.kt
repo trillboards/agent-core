@@ -28,7 +28,7 @@ import kotlinx.serialization.Contextual
  * @param deviceDisplay Display configuration for the first device
  * @param deviceLocation Location for the first device
  * @param deviceName Name for the first device
- * @param partnerType 
+ * @param partnerType Optional legacy classification. Omit for the default self-serve Partner API key.
  */
 @Serializable
 
@@ -53,7 +53,9 @@ data class QuickStartRequest (
     @SerialName(value = "device_name")
     val deviceName: kotlin.String? = null,
 
+    /* Optional legacy classification. Omit for the default self-serve Partner API key. */
     @SerialName(value = "partner_type")
+    @Deprecated(message = "This property is deprecated.")
     val partnerType: kotlin.String? = "digital_signage"
 
 ) {

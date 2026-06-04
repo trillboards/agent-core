@@ -2,6 +2,7 @@ package com.trillboards.ctv.core.ml
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.*
 import java.io.File
@@ -48,6 +49,22 @@ class ModelManager(
 
     // Pre-update accuracy baselines for rejecting bad federated updates
     private val preUpdateBaselines = mutableMapOf<String, Float>()
+
+    // Phase 3 — optional callback wired to `FederatedTrainer.applyPrior(prior, alpha)`
+    // when the server response carries inline `weights[]` (small models like
+    // screen_taste = 64 floats). Forward-compatible: when the field is unset
+    // the OTA path still receives + verifies the prior but no blend happens.
+    @Volatile private var priorCallback: ((modelType: String, prior: FloatArray) -> Unit)? = null
+
+    /**
+     * Register a callback that receives newly-downloaded inline priors.
+     * Phase 2 wires this to `FederatedTrainer.applyPrior` so the local
+     * screen_taste state shrinks toward the server-aggregated cohort prior
+     * on every OTA refresh.
+     */
+    fun setPriorCallback(cb: (modelType: String, prior: FloatArray) -> Unit) {
+        priorCallback = cb
+    }
 
     /**
      * Set the multi-slice context for model fetching.
@@ -142,6 +159,7 @@ class ModelManager(
             val downloadUrl: String
             val version: Int
             val sliceSource: String
+            val inlineWeights: FloatArray?
             try {
                 infoConn.requestMethod = "GET"
                 infoConn.setRequestProperty("x-device-fingerprint", deviceFingerprint)
@@ -157,11 +175,42 @@ class ModelManager(
                     JSONObject(inputStream.bufferedReader().use { it.readText() })
                 }
 
-                downloadUrl = infoResponse.optString("download_url", "")
-                version = infoResponse.optInt("version", 0)
+                // Canonical response carries a nested `model` envelope; older
+                // server builds still emit the legacy top-level fields. Read
+                // both — prefer the envelope when present.
+                val modelEnv = infoResponse.optJSONObject("model")
+                downloadUrl = modelEnv?.optString("downloadUrl", "")
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: infoResponse.optString("download_url", "")
+                version = modelEnv?.optInt("version", 0)
+                    ?.takeIf { it > 0 }
+                    ?: infoResponse.optInt("version", 0)
                 sliceSource = infoResponse.optString("slice_source", "")
+
+                // Phase 3 — when the response ships `weights: number[]` inline
+                // (screen_taste = 64 floats = 256 bytes), pull the array and
+                // skip the S3 fetch entirely. The on-device callback (Phase 2's
+                // `FederatedTrainer.applyPrior`) takes the prior and blends it
+                // into local state.
+                val weightsArray = modelEnv?.optJSONArray("weights")
+                    ?: infoResponse.optJSONArray("weights")
+                inlineWeights = if (weightsArray != null && weightsArray.length() > 0) {
+                    FloatArray(weightsArray.length()) { i ->
+                        weightsArray.optDouble(i, 0.0).toFloat()
+                    }
+                } else null
             } finally {
                 infoConn.disconnect()
+            }
+
+            // Phase 3 — inline-weights short-circuit: pass the prior straight to
+            // `FederatedTrainer.applyPrior` and skip the S3 round trip.
+            if (inlineWeights != null) {
+                priorCallback?.invoke(modelType, inlineWeights)
+                loadedVersions[modelType] = version
+                val sourceInfo = if (sliceSource.isNotEmpty()) " (inherited from: $sliceSource)" else ""
+                Log.i(TAG, "Applied inline weights for $modelType v$version (${inlineWeights.size} floats)$sourceInfo")
+                return true
             }
 
             if (downloadUrl.isEmpty() || version == 0) return false

@@ -7,9 +7,15 @@ import com.trillboards.ctv.core.SensingConfig
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Rect
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.util.Size
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
@@ -102,6 +108,59 @@ internal data class SharedBitmapBufferState(
 )
 
 /**
+ * Confidence floor below which a HAPPY frame is dropped from the
+ * "mid-band positive valence" tally that promotes NEUTRAL → INTERESTED.
+ *
+ * FaceLandmarker emits per-face emotion confidences as the average of
+ * smile/surprise blendshape activations. A frame with a fleeting twitch
+ * (confidence ~0.05) is not the same signal as a sustained smile
+ * (confidence ~0.30+). The floor keeps single-frame noise out of the
+ * INTERESTED promotion path while letting genuine but mid-intensity
+ * positive expression carry the audience above NEUTRAL.
+ */
+internal const val HAPPY_FRAME_CONFIDENCE_FLOOR: Float = 0.15f
+
+/**
+ * Pure ladder helper: maps the engagement composite + valence counts +
+ * happy-frame tally to an [AudienceReaction] tier.
+ *
+ * Cosmic-brewing-bear plan task #33: the previous ladder collapsed any
+ * non-strong positive/negative valence into NEUTRAL, hiding "audience
+ * leaning positive but not fully engaged" — meaningful advertiser-audit
+ * signal. Add an explicit INTERESTED branch for windows where ANY HAPPY
+ * frames cleared [HAPPY_FRAME_CONFIDENCE_FLOOR] but the strong-positive
+ * (HIGHLY_ENGAGED) threshold isn't met.
+ *
+ * Order of precedence (must match aggregateEmotionalEngagement()):
+ *   1. Negative valence wins regardless of intensity.
+ *   2. High composite-score → HIGHLY_ENGAGED.
+ *   3. Mid composite-score → INTERESTED (existing intensity branch).
+ *   4. ANY HAPPY frames above the confidence floor → INTERESTED (NEW —
+ *      mid-band positive valence escapes the NEUTRAL collapse).
+ *   5. Above neutral threshold OR positive valence (any intensity) →
+ *      NEUTRAL.
+ *   6. Catch-all → NEUTRAL.
+ *
+ * Pure / no Android dependencies / unit-testable.
+ */
+internal fun computeAudienceReaction(
+    overallScore: Float,
+    highlyEngagedThreshold: Float,
+    interestedThreshold: Float,
+    neutralThreshold: Float,
+    isNegativeValence: Boolean,
+    isPositiveValence: Boolean,
+    happyFrameCount: Int
+): AudienceReaction = when {
+    isNegativeValence -> AudienceReaction.NEGATIVE
+    overallScore > highlyEngagedThreshold -> AudienceReaction.HIGHLY_ENGAGED
+    overallScore > interestedThreshold -> AudienceReaction.INTERESTED
+    happyFrameCount > 0 -> AudienceReaction.INTERESTED
+    overallScore > neutralThreshold || isPositiveValence -> AudienceReaction.NEUTRAL
+    else -> AudienceReaction.NEUTRAL
+}
+
+/**
  * Analyzes camera feed to detect and track audience members.
  *
  * Privacy-first design:
@@ -144,17 +203,24 @@ class AudienceAnalyzer(
          * that bricked Adam @ Focus Media's screen for 30+ days).
          */
         internal const val FIRST_FRAME_GRACE_MS = 15_000L
+
+        // Phase 1c — upper bound on a single sample's frame interval. Without
+        // this a long pause (camera teardown, attenuation tier swap) would
+        // dump a multi-minute "dwell" into the next bucket. 5 seconds is
+        // comfortably beyond any normal frame cadence (typical 0.2-1s on the
+        // S11) but small enough to keep dwell calculations honest.
+        internal const val PER_FACE_MAX_FRAME_INTERVAL_MS: Long = 5_000L
     }
 
     // Device profile for adaptive settings
     private val deviceProfile by lazy { DeviceProfile.detect(context) }
 
-    // Frame throttler for skipping frames based on device capabilities
+    // Frame throttler for skipping frames based on device capabilities.
+    // cameraFps defaults from SensingConfig (historically 30); it is corrected to
+    // the real production rate once the camera binds and the AE target-FPS range is
+    // pinned — see bindCameraUseCases() → frameThrottler.setCameraFps().
     private val frameThrottler by lazy {
-        FrameThrottler(
-            initialTargetFps = deviceProfile.targetFps,
-            cameraFps = 30
-        )
+        FrameThrottler(initialTargetFps = deviceProfile.targetFps)
     }
 
     // Resource monitor for memory pressure
@@ -236,9 +302,25 @@ class AudienceAnalyzer(
 
     // Emotional engagement processors
     private var poseProcessor: PoseEngagementProcessor? = null
-    private var emotionProcessor: EmotionClassificationProcessor? = null
-    private var gazeProcessor: GazeTrackingProcessor? = null
+    // FaceLandmarker (cosmic-brewing-bear Task #6 + Phase 3 cleanup) — sole
+    // source of per-frame emotion + iris-gaze + head-pose signals. The legacy
+    // EmotionClassificationProcessor (FER+ TFLite, 100% NEUTRAL bias on the
+    // Tab S11 funny-faces soak) and GazeTrackingProcessor (Google ML Kit
+    // FaceMesh head-pose proxy with no iris landmarks) were deleted in this
+    // phase; one FaceLandmarker forward pass produces 52 ARKit blendshapes
+    // (FACS-explicit emotion) + 478 landmarks including iris 468-477 (true
+    // gaze) + a 4×4 facial transformation matrix (head-pose Euler angles).
+    private var faceLandmarkerProcessor: FaceLandmarkerProcessor? = null
     private var emotionalEngagementEnabled = false
+
+    // Zone-dwell heatmap (3×3 viewport grid). Populated from the per-frame
+    // FaceLandmarker gaze focusRegion in processEmotionalEngagementZeroAlloc;
+    // drained by AudienceSensingService at the end of each report window.
+    // Replaces the stateful tracking that lived on the deleted
+    // GazeTrackingProcessor.
+    private val zoneDwellMs = LongArray(9)
+    private var currentZone: Int = 4               // 4 == center of the 3×3 grid
+    private var lastZoneChangeMs: Long = 0
 
     // On-device age/gender processor
     private var ageGenderProcessor: AgeGenderProcessor? = null
@@ -247,6 +329,14 @@ class AudienceAnalyzer(
     // Local TFLite person detector (PoC) — only instantiated if model exists
     private var personDetector: PersonDetectionProcessor? = null
     private var currentPersonCount = 0
+
+    // Multi-class object detector + downstream counting processors.
+    // Reuses the same efficientdet_lite0.tflite as personDetector but configured
+    // for all 80 COCO classes instead of just "person".
+    private var objectDetector: ObjectDetectionProcessor? = null
+    private val vehicleFlowProcessor = VehicleFlowProcessor()
+    private val queueEstimationProcessor = QueueEstimationProcessor()
+
     @Volatile private var desiredVisionSelection: VisionProcessorSelection? = null
 
     // Latest emotional engagement metrics
@@ -259,13 +349,54 @@ class AudienceAnalyzer(
     private val gazeMetricsBuffer = ArrayDeque<GazeMetrics>()
 
     // ============================================================
+    // Phase 1c — per-(face × ad) attention accumulator
+    // ============================================================
+    // Stores the currently-playing ad ID + impression ID so per-frame
+    // sample accumulation can bucket by (adId, faceTrackId). Updated via
+    // [setCurrentAd] from AudienceSensingService whenever the
+    // ContentStateProvider reports an ad-state change.
+    //
+    // 2026-05-11 — currentAdId is now broadened to "current creative ID"
+    // covering ima_programmatic + self_promo + sponsored + default_stream.
+    // currentCreativeSource discriminates the origin so downstream
+    // attribution can distinguish a programmatic ad bid from a free
+    // self-promo placement in the same window.
+    @Volatile private var currentAdId: String? = null
+    @Volatile private var currentImpressionId: String? = null
+    @Volatile private var currentCreativeSource: String? = null
+
+    // perAdAttention[adId][faceTrackId] -> running PerFaceAttention bucket.
+    // ConcurrentHashMap on the outer layer (multi-thread put/get from
+    // setCurrentAd vs aggregator vs frame producer). Inner map is also
+    // concurrent because frames and aggregator drain may overlap.
+    private val perAdAttention =
+        java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<Int, PerFaceAttention>>()
+
+    // adIdToSource[adId] -> "ima_programmatic" | "self_promo" | "sponsored" |
+    // "default_stream". Snapshotted at drain time so the per_face_observations
+    // emit stamps each row with the creative_source it actually came from
+    // (handles multi-creative windows where a self_promo followed an IMA ad).
+    private val adIdToSource =
+        java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // Last per-face sample timestamp — used to compute frameIntervalMs
+    // for dwell-seconds accumulation. Reset on window flush.
+    @Volatile private var lastPerFaceSampleMs: Long = 0L
+
+    // ============================================================
     // Zero-allocation pre-allocated buffers (Phase 1)
     // Allocated once in initializeBuffers(), reused every frame.
     // ============================================================
 
     // Shared bitmap: camera frame is rendered here via manual YUV→RGB conversion.
-    // Lifetime = camera session. Never recycled during operation.
-    private var sharedBitmap: Bitmap? = null
+    // Lifetime = camera session. Never recycled during operation by us, BUT external
+    // consumers must NOT recycle it either — historically PersonDetectionProcessor's
+    // `mpImage.close()` did recycle the source via MediaPipe's
+    // BitmapImageContainer.close() semantics (fixed in
+    // PersonDetectionProcessor.process() — see commit message). Marked @Volatile
+    // defensively in case any future consumer reads/writes from a non-analysis
+    // thread.
+    @Volatile private var sharedBitmap: Bitmap? = null
 
     // NV21 byte array for YUV plane extraction (size = ySize + uSize + vSize)
     private var nv21Buffer: ByteArray? = null
@@ -290,9 +421,6 @@ class AudienceAnalyzer(
     private val _currentSnapshot = MutableStateFlow(AudienceSnapshot())
     val currentSnapshot: StateFlow<AudienceSnapshot> = _currentSnapshot
 
-    // Callback for when metrics are ready to report
-    var onMetricsReady: ((AudienceMetricsPayload) -> Unit)? = null
-
     // Callback for when faces are detected (for FrameCaptureManager demographics trigger)
     var onFacesDetected: ((Int) -> Unit)? = null
 
@@ -308,7 +436,6 @@ class AudienceAnalyzer(
      *  The bitmap is valid only during the callback — caller must copy if needed. */
     var onBitmapAvailable: ((Bitmap) -> Unit)? = null
 
-    private var lastReportTime = System.currentTimeMillis()
     private var isRunning = false
 
     /**
@@ -319,7 +446,7 @@ class AudienceAnalyzer(
         val detCfg = SensingConfig.get().detection
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)  // Required for GazeTrackingProcessor eye landmarks
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)  // Eye landmarks consumed by HeuristicEmotionalEngagementEstimator fallback path
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)  // For eye/smile
             .setMinFaceSize(detCfg.minFaceSize)  // Minimum face size relative to image
             .enableTracking()  // Enable face tracking across frames
@@ -330,11 +457,12 @@ class AudienceAnalyzer(
     }
 
     /**
-     * Initialize emotional engagement processors (pose, emotion, gaze).
+     * Initialize emotional engagement processors (pose + FaceLandmarker for
+     * emotion/gaze/head-pose, plus optional age-gender and person detection).
      *
      * Guards against double initialization: if processors already exist, they are
      * closed first to prevent native memory leaks from orphaned model instances.
-     * Each PoseLandmarker/TFLite interpreter holds ~500MB of native memory.
+     * Each PoseLandmarker/MediaPipe interpreter holds ~500MB of native memory.
      */
     private fun initializeEmotionalEngagement(initialSelection: VisionProcessorSelection? = null) {
         Log.d(TAG, "[EmotionalEngagement] Initializing emotional engagement processors...")
@@ -343,15 +471,16 @@ class AudienceAnalyzer(
         // Without this, each re-init leaks ~500MB of native model weights.
         poseProcessor?.release()
         poseProcessor = null
-        emotionProcessor?.release()
-        emotionProcessor = null
-        gazeProcessor?.reset()
-        gazeProcessor = null
+        faceLandmarkerProcessor?.release()
+        faceLandmarkerProcessor = null
         ageGenderProcessor?.close()
         ageGenderProcessor = null
         ageGenderEnabled = false
         personDetector?.release()
         personDetector = null
+        objectDetector?.release()
+        objectDetector = null
+        resetZoneDwell()
 
         val wantsLegacyFullStack = initialSelection == null
         val wantsPose = wantsLegacyFullStack || initialSelection?.wantsPose == true
@@ -374,22 +503,21 @@ class AudienceAnalyzer(
             }
         }
 
-        if (wantsEmotion) {
-            emotionProcessor = EmotionClassificationProcessor(context).apply {
-                if (hasModel() && initialize()) {
+        if (wantsEmotion || wantsGaze) {
+            // FaceLandmarker is the sole source of emotion + gaze + head-pose
+            // signals in one forward pass per frame. If init fails (asset
+            // missing, low-memory device) we degrade to the heuristic estimator
+            // in HeuristicEmotionalEngagementEstimator, which derives a coarse
+            // engagement signal from ML Kit face metadata only.
+            faceLandmarkerProcessor = FaceLandmarkerProcessor(context).apply {
+                if (initialize()) {
                     processorsInitialized++
-                    Log.i(TAG, "[EmotionalEngagement] Emotion processor initialized")
+                    Log.i(TAG, "[EmotionalEngagement] FaceLandmarker (blendshape emotion + iris gaze + head-pose) initialized — sole emotion/gaze source")
                 } else {
-                    Log.w(TAG, "[EmotionalEngagement] Emotion processor not available (model missing)")
-                    emotionProcessor = null
+                    Log.w(TAG, "[EmotionalEngagement] FaceLandmarker init failed; degrading to ML Kit heuristic estimator only")
+                    faceLandmarkerProcessor = null
                 }
             }
-        }
-
-        if (wantsGaze) {
-            gazeProcessor = GazeTrackingProcessor()
-            processorsInitialized++
-            Log.i(TAG, "[EmotionalEngagement] Gaze processor initialized")
         }
 
         if (wantsAgeGender) {
@@ -413,6 +541,22 @@ class AudienceAnalyzer(
                 pdCandidate.release()
                 Log.d(TAG, "[PersonDetection] TFLite model not available — skipping (not on device)")
             }
+
+            // Wire ObjectDetectionProcessor + VehicleFlowProcessor + QueueEstimationProcessor.
+            // Reuses the same efficientdet_lite0.tflite — no additional model download.
+            // ObjectDetectionProcessor is separate from PersonDetectionProcessor so it can
+            // filter all 80 COCO classes (vehicles, persons in queue context, etc.) while
+            // personDetector continues its existing person-only count path unchanged.
+            val odCandidate = ObjectDetectionProcessor(context)
+            if (odCandidate.hasModel() && odCandidate.initialize()) {
+                objectDetector = odCandidate
+                vehicleFlowProcessor.reset()
+                queueEstimationProcessor.reset()
+                Log.i(TAG, "[ObjectDetection] Multi-class detector initialized (vehicles + pedestrians)")
+            } else {
+                odCandidate.release()
+                Log.d(TAG, "[ObjectDetection] Model not available — skipping (not on device)")
+            }
         }
 
         refreshProcessorActivationState(processorsInitialized > 0)
@@ -425,7 +569,7 @@ class AudienceAnalyzer(
     }
 
     private fun hasEmotionalProcessorsEnabled(): Boolean {
-        return poseProcessor != null || emotionProcessor != null || gazeProcessor != null || ageGenderEnabled
+        return poseProcessor != null || faceLandmarkerProcessor != null || ageGenderEnabled
     }
 
     private fun hasSharedBitmapConsumers(): Boolean {
@@ -654,13 +798,13 @@ class AudienceAnalyzer(
         val pixels = yuvPixelBuffer ?: return false
 
         buffer.rewind()
-        val width = bitmap.width
-        val height = bitmap.height
 
-        // Pixels are already in yuvPixelBuffer from imageProxyToSharedBitmap()
-        // Re-read from bitmap to be safe (setPixels was called on the bitmap)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
+        // yuvPixelBuffer was fully populated by imageProxyToSharedBitmap() this
+        // frame via the YUV→RGB loop + bitmap.setPixels(). It has not been
+        // touched since (single analysisExecutor thread; MediaPipe ByteBuffer
+        // wrappers are read-only consumers), so we read directly from it — no
+        // getPixels() round-trip needed (that was a 1.38 MB JNI memcopy per
+        // frame at 7 fps ≈ 10 MB/s of wasted native↔JVM bandwidth).
         for (pixel in pixels) {
             buffer.put(((pixel shr 16) and 0xFF).toByte()) // R
             buffer.put(((pixel shr 8) and 0xFF).toByte())  // G
@@ -897,10 +1041,9 @@ class AudienceAnalyzer(
         // Release emotional engagement processors
         poseProcessor?.release()
         poseProcessor = null
-        emotionProcessor?.release()
-        emotionProcessor = null
-        gazeProcessor?.reset()
-        gazeProcessor = null
+        faceLandmarkerProcessor?.release()
+        faceLandmarkerProcessor = null
+        resetZoneDwell()
         ageGenderProcessor?.close()
         ageGenderProcessor = null
         ageGenderEnabled = false
@@ -908,7 +1051,10 @@ class AudienceAnalyzer(
         personDetector?.release()
         personDetector = null
         currentPersonCount = 0
-        
+
+        objectDetector?.release()
+        objectDetector = null
+
         emotionalEngagementEnabled = false
         poseMetricsBuffer.clear()
         emotionMetricsBuffer.clear()
@@ -916,9 +1062,6 @@ class AudienceAnalyzer(
 
         // Release pre-allocated buffers
         releaseBuffers(recycleBitmaps = true)
-
-        // Final report
-        generateAndSendReport()
 
         trackedFaces.clear()
         peakViewerCount = 0
@@ -1110,6 +1253,62 @@ class AudienceAnalyzer(
     }
 
     /**
+     * Pin the camera AE target-FPS range so the HAL produces frames near the
+     * analysis rate instead of free-running toward 30fps. Mutates [builder] in
+     * place via [Camera2Interop.Extender] and corrects the throttler's assumed
+     * production rate. No-op (HAL default left intact) if the device reports no AE
+     * ranges or the query fails — never pin an unsupported range.
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyAeFpsCap(
+        builder: ImageAnalysis.Builder,
+        provider: ProcessCameraProvider,
+        selector: CameraSelector
+    ) {
+        // Uncapped HAL rate; the throttler is reset to this on every path that does
+        // NOT pin a cap, so a rebind that falls back to HAL default never leaves the
+        // throttler decimating from a stale cap set by a previous successful bind.
+        val defaultCameraFps = SensingConfig.get().capture.cameraFps
+        var capApplied = false
+        try {
+            val cameraInfo = selector.filter(provider.availableCameraInfos).firstOrNull()
+            if (cameraInfo == null) {
+                Log.w(TAG, "[Camera] No CameraInfo for AE FPS cap — leaving HAL default")
+            } else {
+                val ranges = Camera2CameraInfo.from(cameraInfo)
+                    .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                if (ranges == null || ranges.isEmpty()) {
+                    Log.w(TAG, "[Camera] No AE target-FPS ranges reported — leaving HAL default")
+                } else {
+                    val available = ranges.map { AeFpsRangeSelector.FpsRange(it.lower, it.upper) }
+                    val chosen = AeFpsRangeSelector.select(available, FrameThrottler.MAX_FPS)
+                    if (chosen == null) {
+                        Log.w(TAG, "[Camera] AE FPS-range selection empty — leaving HAL default")
+                    } else {
+                        Camera2Interop.Extender(builder).setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                            Range(chosen.min, chosen.max)
+                        )
+                        // Throttler decimates from the real (capped) rate, not 30.
+                        frameThrottler.setCameraFps(chosen.max)
+                        capApplied = true
+                        Log.i(TAG, "[Camera] AE target-FPS pinned to ${chosen.min}-${chosen.max}fps " +
+                                "(analyzer ceiling ${FrameThrottler.MAX_FPS}fps) — caps HAL production; " +
+                                "available=${available.joinToString { "${it.min}-${it.max}" }}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[Camera] AE FPS cap failed — leaving HAL default", e)
+        }
+        if (!capApplied) {
+            // No cap pinned on this (re)bind: HAL runs at its default rate, so reset
+            // the throttler to match instead of inheriting a previous bind's cap.
+            frameThrottler.setCameraFps(defaultCameraFps)
+        }
+    }
+
+    /**
      * Bind camera use cases - BOTH ImageAnalysis (ML Kit) and ImageCapture (Gemini demographics).
      * CameraX requires all use cases to be bound together.
      */
@@ -1191,9 +1390,19 @@ class AudienceAnalyzer(
             )
             .build()
 
-        imageAnalysis = ImageAnalysis.Builder()
+        val analysisBuilder = ImageAnalysis.Builder()
             .setResolutionSelector(analysisResolutionSelector)  // Adaptive resolution based on chipset
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+
+        // Cap camera frame *production* near the analysis rate. Without a pinned AE
+        // target-FPS range the HAL free-runs toward 30fps (~21 observed on the Tab
+        // A9) for a ≤15fps analyzer; the surplus frames burn the camera-provider
+        // core + CMA and are then dropped by the throttler, driving chronic zram
+        // swap. This also corrects the throttler's production-rate assumption so its
+        // decimation hits the target FPS.
+        applyAeFpsCap(analysisBuilder, provider, cameraSelector)
+
+        imageAnalysis = analysisBuilder
             .build()
             .also { analysis ->
                 analysis.setAnalyzer(analysisExecutor) { imageProxy ->
@@ -1328,18 +1537,55 @@ class AudienceAnalyzer(
                             return@withLease
                         }
 
+                        // Phase 1E: fill the RGB ByteBuffer ONCE per frame, shared
+                        // across processEmotionalEngagementZeroAlloc + personDetector
+                        // (was 2 fills/frame = 1.38 MB JNI memcopy waste). Only fill
+                        // when at least one consumer is active; avoids the fill in
+                        // configurations where both are disabled/null.
+                        val sharedPoseBuffer = poseInputBuffer
+                        val needsBuffer = emotionalEngagementEnabled || personDetector?.isReady() == true
+                        val bufferReady = needsBuffer && sharedPoseBuffer != null && fillRgbByteBuffer()
+
                         if (emotionalEngagementEnabled) {
                             processEmotionalEngagementZeroAlloc(
                                 leasedBitmap,
                                 faces,
                                 imageProxy.width,
-                                imageProxy.height
+                                imageProxy.height,
+                                sharedPoseBuffer,
+                                bufferReady
                             )
                         }
 
                         personDetector?.let { detector ->
                             if (detector.isReady()) {
-                                currentPersonCount = detector.process(leasedBitmap)
+                                // Zero-alloc: reuse the shared RGB buffer filled once
+                                // above instead of a second fillRgbByteBuffer() call.
+                                // Falls back to the bitmap path when the buffer isn't
+                                // ready.
+                                currentPersonCount = if (bufferReady && sharedPoseBuffer != null) {
+                                    detector.processWithBuffer(sharedPoseBuffer, imageProxy.width, imageProxy.height)
+                                } else {
+                                    detector.process(leasedBitmap)
+                                }
+                            }
+                        }
+
+                        // Multi-class object detection — mirrors personDetector pattern.
+                        // ObjectDetectionProcessor detects all 80 COCO classes; results are
+                        // fed to VehicleFlowProcessor and QueueEstimationProcessor which
+                        // aggregate per-window counts at each 10s flush.
+                        objectDetector?.let { detector ->
+                            if (detector.isReady()) {
+                                val detectionResult = detector.detect(leasedBitmap)
+                                vehicleFlowProcessor.recordSnapshot(detectionResult)
+                                // QueueEstimationProcessor uses face count (from ML Kit) +
+                                // dwell time as its snapshot inputs — vehicle frame result
+                                // gives us the person count in the current frame for the queue.
+                                val pedestrianCount = detectionResult.objectCounts["person"] ?: 0
+                                val avgDwellMs = (trackedFaces.values.map { it.getDwellTimeSeconds() * 1000 }
+                                    .takeIf { it.isNotEmpty() }?.average()?.toLong() ?: 0L)
+                                queueEstimationProcessor.recordSnapshot(pedestrianCount, avgDwellMs)
                             }
                         }
 
@@ -1355,7 +1601,6 @@ class AudienceAnalyzer(
             }
             ?.addOnCompleteListener(analysisExecutor) {
                 imageProxy.close()
-                checkReportInterval()
 
                 // Camera health heartbeat — prevents RecoveryLadder false-positive.
                 // Also notifies CameraHealthMonitor so the OPEN state transitions
@@ -1424,23 +1669,32 @@ class AudienceAnalyzer(
         bitmap: Bitmap,
         faces: List<Face>,
         imageWidth: Int,
-        imageHeight: Int
+        imageHeight: Int,
+        poseBuffer: ByteBuffer?,
+        bufferReady: Boolean
     ) {
         try {
             // Process pose using pre-allocated ByteBuffer (zero-alloc path)
             val detCfg = SensingConfig.get().detection
+            // poseBuffer and bufferReady are hoisted from the withLease call site
+            // (Phase 1E): the buffer is filled ONCE per frame and shared across
+            // processEmotionalEngagementZeroAlloc + personDetector. Pose AND
+            // FaceLandmarker both consume it zero-alloc (ByteBufferImageBuilder
+            // wraps it without copying or recycling). MediaPipe detect() is
+            // synchronous and doesn't mutate the input, so the sequential readers
+            // safely share one filled buffer.
             poseProcessor?.let { pose ->
                 if (pose.isReady()) {
-                    val poseBuffer = poseInputBuffer
-                    if (poseBuffer != null && fillRgbByteBuffer()) {
+                    if (bufferReady && poseBuffer != null) {
                         // Build engagement context from the same frame's face list.
-                        // screenEngaged uses the same head-yaw/pitch envelope as
-                        // GazeTrackingProcessor.isLookingAtScreen (gazeCfg thresholds × 2),
-                        // so a single face whose head rotation is within bounds means
-                        // "user is stably looking at the screen". Pose's own facing-angle
-                        // is intentionally NOT used here: it derives from shoulder
-                        // geometry (a different signal source) and would couple two
-                        // engagement gates to the same noisy primitive.
+                        // screenEngaged uses the same head-yaw/pitch envelope that
+                        // FaceLandmarker's HeadPose.isFacingScreen() applies (gazeCfg
+                        // thresholds × 2), so a single face whose head rotation is
+                        // within bounds means "user is stably looking at the screen".
+                        // Pose's own facing-angle is intentionally NOT used here: it
+                        // derives from shoulder geometry (a different signal source)
+                        // and would couple two engagement gates to the same noisy
+                        // primitive.
                         val gazeCfg = SensingConfig.get().gaze
                         val anyFaceLooking = faces.any { f ->
                             kotlin.math.abs(f.headEulerAngleY) < gazeCfg.headYawThreshold * 2 &&
@@ -1463,39 +1717,178 @@ class AudienceAnalyzer(
                 }
             }
 
-            // Process emotions for each face using pre-allocated crop bitmap
+            // Process emotions + gaze for each face — FaceLandmarker is the
+            // SOLE source after Phase 3 cleanup. One forward pass produces
+            // blendshape-derived emotion (FACS-explicit, no NEUTRAL bias)
+            // AND iris-based gaze direction AND head-pose Euler angles.
+            // When FaceLandmarker is unavailable (init failed, asset missing)
+            // these buffers stay empty and aggregateEmotionalEngagement() falls
+            // back to HeuristicEmotionalEngagementEstimator on the face list.
             if (faces.isNotEmpty()) {
-                val emotionCrop = emotionCropBitmap
-                emotionProcessor?.let { emotion ->
-                    if (emotion.isReady() && emotionCrop != null) {
-                        // Zero-alloc path: use Canvas to crop+scale into pre-allocated bitmap
-                        val emotionMetrics = emotion.processMultipleWithPreallocatedCrop(
-                            bitmap, faces, emotionCrop
+                val flResult = if (bufferReady && poseBuffer != null) {
+                    faceLandmarkerProcessor?.processWithBuffer(poseBuffer, imageWidth, imageHeight)
+                } else {
+                    faceLandmarkerProcessor?.process(bitmap)
+                }
+                val flUsable = flResult != null && flResult.faces.isNotEmpty()
+                    && kotlin.math.abs(flResult.faces.size - faces.size) <= 1
+                if (flUsable) {
+                    val now = System.currentTimeMillis()
+                    // Phase 1c collapse-point #1 fix: bind FaceLandmarker
+                    // output to ML Kit's stable face track IDs via box-IoU
+                    // match. Previously emotions/gaze were zipped by list
+                    // index — fragile when the two detectors disagree on
+                    // ordering, and the faceId was never carried forward at
+                    // all so the per-(face × ad) accumulator (collapse
+                    // point #3) had nothing to bucket on.
+                    //
+                    // The mapping is computed ONCE up-front so emotion and
+                    // gaze paths agree on which FaceLandmarker face → which
+                    // ML Kit faceId.
+                    val flFaceIdMap = mutableMapOf<Int, Int>()  // FaceLandmarker index -> ML Kit faceId
+                    flResult!!.faces.forEachIndexed { idx, flFace ->
+                        val derivedBox = deriveBoundingBoxFromLandmarks(
+                            flFace.landmarks, imageWidth, imageHeight
                         )
-                        synchronized(emotionMetricsBuffer) {
-                            emotionMetricsBuffer.addAll(emotionMetrics)
-                            while (emotionMetricsBuffer.size > detCfg.maxBufferedMetrics) emotionMetricsBuffer.removeFirst()
-                        }
-                    } else {
-                        // Fall back to ML Kit heuristics (no TFLite model)
-                        val heuristicEmotions = faces.map { emotion.classifyFromMLKit(it) }
-                        synchronized(emotionMetricsBuffer) {
-                            emotionMetricsBuffer.addAll(heuristicEmotions)
-                            while (emotionMetricsBuffer.size > detCfg.maxBufferedMetrics) emotionMetricsBuffer.removeFirst()
+                        if (derivedBox != null) {
+                            val matchedId = findOverlappingFace(derivedBox)
+                            if (matchedId != null) {
+                                flFaceIdMap[idx] = matchedId
+                            } else if (idx < faces.size) {
+                                // Fallback: bind to faces[idx]'s tracking
+                                // ID when ML Kit has assigned one. Preserves
+                                // backward-compat when IoU dedup hasn't
+                                // recorded a tracked face for this frame yet.
+                                faces[idx].trackingId?.let { flFaceIdMap[idx] = it }
+                            }
                         }
                     }
-                }
+                    val flEmotions = flResult.faces.mapIndexed { idx, face ->
+                        val (positiveScore, negativeScore) = when (face.emotion.emotion) {
+                            EmotionType.HAPPY, EmotionType.SURPRISED -> face.emotion.confidence to 0f
+                            EmotionType.SAD, EmotionType.ANGRY, EmotionType.FEARFUL, EmotionType.DISGUSTED, EmotionType.CONTEMPT -> 0f to face.emotion.confidence
+                            else -> 0f to 0f
+                        }
+                        EmotionMetrics(
+                            timestamp = now,
+                            dominantEmotion = face.emotion.emotion,
+                            emotionConfidence = face.emotion.confidence,
+                            happyScore = if (face.emotion.emotion == EmotionType.HAPPY) face.emotion.confidence else 0f,
+                            surprisedScore = if (face.emotion.emotion == EmotionType.SURPRISED) face.emotion.confidence else 0f,
+                            sadScore = if (face.emotion.emotion == EmotionType.SAD) face.emotion.confidence else 0f,
+                            angryScore = if (face.emotion.emotion == EmotionType.ANGRY) face.emotion.confidence else 0f,
+                            neutralScore = if (face.emotion.emotion == EmotionType.NEUTRAL) face.emotion.confidence else 0f,
+                            isPositiveReaction = positiveScore > 0f,
+                            isNegativeReaction = negativeScore > 0f,
+                            // Engagement = blendshape activation magnitude
+                            // (clamped 0..1). Strong emotion → high engagement,
+                            // neutral → zero (matches legacy FER+ semantics).
+                            emotionalEngagementScore = if (face.emotion.emotion == EmotionType.NEUTRAL) {
+                                0f
+                            } else {
+                                face.emotion.confidence.coerceIn(0f, 1f)
+                            },
+                            confidence = face.emotion.confidence,
+                            faceId = flFaceIdMap[idx],
+                        )
+                    }
+                    synchronized(emotionMetricsBuffer) {
+                        emotionMetricsBuffer.addAll(flEmotions)
+                        while (emotionMetricsBuffer.size > detCfg.maxBufferedMetrics) emotionMetricsBuffer.removeFirst()
+                    }
 
-                // Process gaze for each face (pure math from landmarks — already zero-alloc)
-                gazeProcessor?.let { gaze ->
-                    val gazeMetrics = gaze.processMultiple(faces, imageWidth, imageHeight)
+                    // Gaze: FaceLandmarker iris landmarks (468-477 in the 478-point
+                    // mesh) drive both gaze direction and the 3×3 focus-region zone
+                    // for the creativeZones heatmap. Head pose comes from the
+                    // facial transformation matrix decomposition (true Euler angles).
+                    val flGazeMetrics = flResult.faces.mapIndexed { idx, face ->
+                        val gaze = face.gazeDirection
+                        val pose = face.headPoseDeg
+                        // 3x3 focus region: dx ∈ [-1,1] → col ∈ {0,1,2}; same for dy → row.
+                        // Region index = row * 3 + col, with center = 4.
+                        val col = when {
+                            gaze.dx < -0.33f -> 0
+                            gaze.dx > 0.33f -> 2
+                            else -> 1
+                        }
+                        val row = when {
+                            gaze.dy < -0.33f -> 0
+                            gaze.dy > 0.33f -> 2
+                            else -> 1
+                        }
+                        val focusRegion = row * 3 + col
+                        // isLookingAtScreen mirrors legacy thresholds (yaw < 20°, pitch < 15°)
+                        val isLooking = pose.isFacingScreen()
+                        // Iris-magnitude-based stability proxy: small iris deflection
+                        // (looking forward) → high stability; large deflection → erratic.
+                        val gazeStability = (1f - gaze.magnitude()).coerceIn(0f, 1f)
+                        // Attention score: gazeStability if looking at screen, else 0.
+                        val attentionScore = if (isLooking) gazeStability else 0f
+                        GazeMetrics(
+                            timestamp = now,
+                            focusRegion = focusRegion,
+                            isLookingAtScreen = isLooking,
+                            gazeStability = gazeStability,
+                            headRotationX = pose.pitchDeg,
+                            headRotationY = pose.yawDeg,
+                            headRotationZ = pose.rollDeg,
+                            attentionScore = attentionScore,
+                            confidence = 1f,
+                            faceId = flFaceIdMap[idx],
+                        )
+                    }
                     synchronized(gazeMetricsBuffer) {
-                        gazeMetricsBuffer.addAll(gazeMetrics)
+                        gazeMetricsBuffer.addAll(flGazeMetrics)
                         while (gazeMetricsBuffer.size > detCfg.maxBufferedMetrics) gazeMetricsBuffer.removeFirst()
+                    }
+                    // Update zone-dwell heatmap from the dominant face (first detected)
+                    // — the same face whose attentionScore drives the engagement composite.
+                    flGazeMetrics.firstOrNull()?.let { primary ->
+                        if (primary.isLookingAtScreen) updateZoneDwell(primary.focusRegion)
+                    }
+
+                    // Phase 1c collapse-point #3 fix: per-(face × ad)
+                    // accumulation. Walk the paired emotion+gaze samples
+                    // and bucket each into the per-ad map. Frames captured
+                    // while no ad is playing are skipped inside
+                    // accumulatePerFaceSample (currentAdId == null guard).
+                    // Frame interval: time since last sample, capped at
+                    // PER_FACE_MAX_FRAME_INTERVAL_MS to keep long pauses
+                    // from inflating dwell time.
+                    val lastSampleAt = lastPerFaceSampleMs
+                    val frameIntervalMs = if (lastSampleAt > 0L && now > lastSampleAt) {
+                        (now - lastSampleAt).coerceAtMost(PER_FACE_MAX_FRAME_INTERVAL_MS)
+                    } else {
+                        EmotionalEngagementConfig().emotionProcessingIntervalMs
+                    }
+                    lastPerFaceSampleMs = now
+                    val pairCount = minOf(flEmotions.size, flGazeMetrics.size)
+                    for (i in 0 until pairCount) {
+                        val em = flEmotions[i]
+                        val gz = flGazeMetrics[i]
+                        val faceId = em.faceId ?: gz.faceId ?: continue
+                        accumulatePerFaceSample(
+                            faceId = faceId,
+                            nowMs = now,
+                            attentionScore = gz.attentionScore,
+                            gazeAttentionScore = gz.attentionScore,
+                            isLookingAtScreen = gz.isLookingAtScreen,
+                            focusRegion = gz.focusRegion,
+                            emotion = em.dominantEmotion,
+                            emotionConfidence = em.emotionConfidence,
+                            frameIntervalMs = frameIntervalMs,
+                        )
                     }
                 }
 
                 // On-device age/gender using pre-allocated crop bitmap (zero-alloc)
+                //
+                // Phase 1c collapse-point #4 fix: pass the ML Kit face track
+                // ID through to `accumulateWithFaceId`. The histogram
+                // counters still update (preserves existing aggregate emit);
+                // the per-face overlay map records the latest result per
+                // faceId so drainPerAdAttention() can thread age/gender
+                // into the matching PerFaceAttention bucket.
                 if (ageGenderEnabled) {
                     val agCrop = ageGenderCropBitmap
                     ageGenderProcessor?.let { agp ->
@@ -1506,7 +1899,19 @@ class AudienceAnalyzer(
                                         bitmap, face.boundingBox, agCrop
                                     )
                                     if (result != null) {
-                                        agp.accumulate(result)
+                                        val rawId = face.trackingId
+                                        val boundingBox = FaceRect(
+                                            left = face.boundingBox.left,
+                                            top = face.boundingBox.top,
+                                            right = face.boundingBox.right,
+                                            bottom = face.boundingBox.bottom,
+                                        )
+                                        val effId = findOverlappingFace(boundingBox) ?: rawId
+                                        if (effId != null) {
+                                            agp.accumulateWithFaceId(effId, result)
+                                        } else {
+                                            agp.accumulate(result)
+                                        }
                                     }
                                 } catch (e: Exception) {
                                     Log.w(TAG, "[AgeGender] Classification failed: ${e.message}")
@@ -1575,9 +1980,11 @@ class AudienceAnalyzer(
                 leaningInCount = poseSnapshots.count { it.leanDirection == LeanDirection.LEANING_IN },
                 leaningBackCount = poseSnapshots.count { it.leanDirection == LeanDirection.LEANING_BACK },
                 avgLeanMagnitude = poseSnapshots.map { it.leanMagnitude }.average().toFloat(),
-                stoppedCount = poseSnapshots.count { it.movementState == MovementState.STOPPED },
-                walkingPastCount = poseSnapshots.count { it.movementState == MovementState.WALKING_FAST },
-                approachingCount = poseSnapshots.count { it.movementState == MovementState.APPROACHING }, // always 0 — requires depth
+                // One pass over snapshots → Map<MovementState, Int>. Adding a new movement
+                // state (e.g. when depth-aware tracking lands and APPROACHING / DEPARTING
+                // start emitting) requires only adding to the MovementState enum — the
+                // distribution flows through automatically.
+                movementDistribution = poseSnapshots.groupingBy { it.movementState }.eachCount(),
                 avgMovementSpeed = poseSnapshots.map { it.movementSpeed }.average().toFloat(),
                 bodyEngagementScore = poseSnapshots.map { it.bodyEngagementScore }.average().toFloat()
             )
@@ -1604,8 +2011,8 @@ class AudienceAnalyzer(
             )
         } else null
 
-        // Aggregate gaze metrics
-        val aggregatedGaze = gazeProcessor?.aggregateMetrics(gazeSnapshots)
+        // Aggregate gaze metrics — pure helper (no processor instance needed).
+        val aggregatedGaze = if (gazeSnapshots.isNotEmpty()) aggregateGazeSnapshots(gazeSnapshots) else null
 
         // Calculate overall engagement score
         val config = EmotionalEngagementConfig()
@@ -1627,16 +2034,64 @@ class AudienceAnalyzer(
 
         val overallScore = if (totalWeight > 0) weightedScore / totalWeight else 0f
 
-        // Determine audience reaction
+        // Determine audience reaction (2026-05-08 reform — soak findings):
+        // The OLD ladder treated DISINTERESTED as the catch-all for ANY
+        // overallScore < neutralThreshold. That meant a relaxed couch viewer
+        // (neutral expression, low body movement, gaze toward something) was
+        // labeled DISINTERESTED — a negative-valence reaction — when their
+        // actual emotional state was neutral. Tab S11 soak: 62/66 windows
+        // tagged DISINTERESTED with dominant emotion NEUTRAL@0.93. Catch-all
+        // semantics conflated "low engagement intensity" with "negative
+        // valence". Two separate concepts.
+        //
+        // New L9 ladder separates intensity (engagement composite) from
+        // valence (FER classifier). Negative-valence is now an early branch
+        // (independent of intensity) and the catch-all for low-intensity is
+        // NEUTRAL — the honest default when emotion is neither positive nor
+        // negative.
+        //
+        // Also fixes the precedence bug at the old line: `x ?: 0 > y ?: 0`
+        // parses as `x ?: (0 > (y ?: 0))` because elvis is lower precedence
+        // than comparison. Result: the NEGATIVE branch never fired correctly.
+        // Explicit parens fix the parse.
+        //
+        // FOLLOW-UP (cosmic-brewing-bear plan B9):
+        //   - MediaPipe FaceLandmarker v2 emits 52 blendshape coefficients
+        //     per face. Replace the 7-class FER classifier with blendshape-
+        //     derived emotion (smile_L/R, brow_lower, mouth_frown). Per-face
+        //     classification, aggregated to {pos, neu, neg} distribution
+        //     with face-seconds weighting. min-N ≥ 5 face-seconds to display.
+        //
+        // FOLLOW-UP (cosmic-brewing-bear plan task #33):
+        //   - When ANY HAPPY frames clear HAPPY_FRAME_CONFIDENCE_FLOOR but
+        //     the strong-POSITIVE (HIGHLY_ENGAGED) intensity isn't met,
+        //     promote NEUTRAL → INTERESTED. Mid-band positive valence is
+        //     meaningful advertiser-audit signal ("audience leaning
+        //     positive but not fully engaged") and should not collapse
+        //     into NEUTRAL. Ladder lives in computeAudienceReaction() so
+        //     the unit tests can exercise it without spinning up a
+        //     CameraX/Android stack.
         val detCfg = SensingConfig.get().detection
-        val audienceReaction = when {
-            overallScore > detCfg.highlyEngagedThreshold -> AudienceReaction.HIGHLY_ENGAGED
-            overallScore > detCfg.interestedThreshold -> AudienceReaction.INTERESTED
-            overallScore > detCfg.neutralThreshold -> AudienceReaction.NEUTRAL
-            aggregatedEmotion?.negativeReactionCount ?: 0 > aggregatedEmotion?.positiveReactionCount ?: 0 ->
-                AudienceReaction.NEGATIVE
-            else -> AudienceReaction.DISINTERESTED
+        val negativeCount = aggregatedEmotion?.negativeReactionCount ?: 0
+        val positiveCount = aggregatedEmotion?.positiveReactionCount ?: 0
+        val isNegativeValence = negativeCount > positiveCount
+        val isPositiveValence = positiveCount > 0 && positiveCount > negativeCount
+        // Tally HAPPY frames whose per-face emotionConfidence cleared the
+        // confidence floor. Fleeting <0.15 twitches stay out of the
+        // promotion path.
+        val happyFrameCount = emotionSnapshots.count {
+            it.dominantEmotion == EmotionType.HAPPY &&
+                it.emotionConfidence > HAPPY_FRAME_CONFIDENCE_FLOOR
         }
+        val audienceReaction = computeAudienceReaction(
+            overallScore = overallScore,
+            highlyEngagedThreshold = detCfg.highlyEngagedThreshold,
+            interestedThreshold = detCfg.interestedThreshold,
+            neutralThreshold = detCfg.neutralThreshold,
+            isNegativeValence = isNegativeValence,
+            isPositiveValence = isPositiveValence,
+            happyFrameCount = happyFrameCount
+        )
 
         val engagement = EmotionalEngagement(
             pose = aggregatedPose,
@@ -1658,42 +2113,222 @@ class AudienceAnalyzer(
         return engagement
     }
 
+    // ============================================================
+    // Box geometry helpers — delegate to BoxTracking (shared with
+    // VehicleFlowProcessor / QueueEstimationProcessor). FaceRect is
+    // pixel-space; BoxTracking.BoxRect is Float-based, so we convert.
+    // ============================================================
+
+    private fun FaceRect.toBoxRect() = BoxTracking.BoxRect(
+        left = left.toFloat(), top = top.toFloat(),
+        right = right.toFloat(), bottom = bottom.toFloat()
+    )
+
     /**
      * Calculate Intersection over Union (IoU) for two bounding boxes.
-     * Used to detect if two face detections are the same person.
-     * Higher IoU = more overlap = likely same face.
+     * Delegates to [BoxTracking.iou] — shared kernel with object counting.
      */
-    private fun calculateIoU(box1: FaceRect, box2: FaceRect): Float {
-        val xOverlap = maxOf(0, minOf(box1.right, box2.right) - maxOf(box1.left, box2.left))
-        val yOverlap = maxOf(0, minOf(box1.bottom, box2.bottom) - maxOf(box1.top, box2.top))
-        val intersection = xOverlap * yOverlap
-
-        val area1 = (box1.right - box1.left) * (box1.bottom - box1.top)
-        val area2 = (box2.right - box2.left) * (box2.bottom - box2.top)
-        val union = area1 + area2 - intersection
-
-        return if (union > 0) intersection.toFloat() / union else 0f
-    }
+    private fun calculateIoU(box1: FaceRect, box2: FaceRect): Float =
+        BoxTracking.iou(box1.toBoxRect(), box2.toBoxRect())
 
     /**
      * Calculate centroid distance between two bounding boxes.
-     * More robust than IoU for head rotation because face center moves less.
+     * Delegates to [BoxTracking.centroidDistance].
      */
-    private fun calculateCentroidDistance(box1: FaceRect, box2: FaceRect): Float {
-        val cx1 = (box1.left + box1.right) / 2f
-        val cy1 = (box1.top + box1.bottom) / 2f
-        val cx2 = (box2.left + box2.right) / 2f
-        val cy2 = (box2.top + box2.bottom) / 2f
-        return kotlin.math.sqrt((cx2 - cx1) * (cx2 - cx1) + (cy2 - cy1) * (cy2 - cy1))
-    }
+    private fun calculateCentroidDistance(box1: FaceRect, box2: FaceRect): Float =
+        BoxTracking.centroidDistance(box1.toBoxRect(), box2.toBoxRect())
 
     /**
      * Calculate average face size (for relative distance thresholding).
+     * Delegates to [BoxTracking.averageSize].
      */
-    private fun averageFaceSize(box1: FaceRect, box2: FaceRect): Float {
-        val size1 = maxOf(box1.right - box1.left, box1.bottom - box1.top)
-        val size2 = maxOf(box2.right - box2.left, box2.bottom - box2.top)
-        return (size1 + size2) / 2f
+    private fun averageFaceSize(box1: FaceRect, box2: FaceRect): Float =
+        BoxTracking.averageSize(box1.toBoxRect(), box2.toBoxRect())
+
+    /**
+     * Derive a pixel-space bounding box from a FaceLandmarker face's
+     * normalized landmarks (x,y in [0..1]). Phase 1c uses this to bind
+     * FaceLandmarker output back to ML Kit's stable track IDs via
+     * [findOverlappingFace] — the existing IoU dedup that operates on
+     * pixel-space FaceRect.
+     *
+     * Returns null when the landmarks list is empty or image dims are bad.
+     */
+    internal fun deriveBoundingBoxFromLandmarks(
+        landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>,
+        imageWidth: Int,
+        imageHeight: Int,
+    ): FaceRect? {
+        if (landmarks.isEmpty() || imageWidth <= 0 || imageHeight <= 0) return null
+        var minX = Float.POSITIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+        for (lm in landmarks) {
+            if (lm.x() < minX) minX = lm.x()
+            if (lm.y() < minY) minY = lm.y()
+            if (lm.x() > maxX) maxX = lm.x()
+            if (lm.y() > maxY) maxY = lm.y()
+        }
+        if (!minX.isFinite() || !maxX.isFinite()) return null
+        return FaceRect(
+            left = (minX * imageWidth).toInt().coerceAtLeast(0),
+            top = (minY * imageHeight).toInt().coerceAtLeast(0),
+            right = (maxX * imageWidth).toInt().coerceAtMost(imageWidth),
+            bottom = (maxY * imageHeight).toInt().coerceAtMost(imageHeight),
+        )
+    }
+
+    // ============================================================
+    // Phase 1c — per-(face × ad) attention accumulator API
+    // ============================================================
+
+    /**
+     * Update the currently-playing ad context.
+     *
+     * Called from [AudienceSensingService] when the
+     * [ContentStateProvider]'s reported ad changes. Subsequent per-frame
+     * samples are bucketed under this (adId, faceTrackId) until the ad
+     * changes again. Pass `null` adId to indicate idle / no ad playing —
+     * frames captured during idle are not accumulated into the per-ad map
+     * (only ad-playback windows produce per-face observations).
+     */
+    fun setCurrentAd(adId: String?, impressionId: String?) {
+        setCurrentAd(adId, impressionId, source = null)
+    }
+
+    /**
+     * 3-arg overload: also records `source` (ima_programmatic / self_promo /
+     * sponsored / default_stream) into `adIdToSource` so drainPerAdAttention
+     * can stamp each per-face row with the creative_source it actually came
+     * from. Existing 2-arg callers default to source=null (back-compat).
+     */
+    fun setCurrentAd(adId: String?, impressionId: String?, source: String?) {
+        currentAdId = adId
+        currentImpressionId = impressionId
+        currentCreativeSource = source
+        if (adId != null && source != null) {
+            // Record once per (adId, source). If the same adId reappears with
+            // a different source, last write wins — which is correct since a
+            // single adId belongs to one source in practice.
+            adIdToSource[adId] = source
+        }
+    }
+
+    /** Reads the currently-set ad for tests / introspection. */
+    internal fun getCurrentAdIdForTesting(): String? = currentAdId
+
+    /** Reads the currently-set creative source for tests / introspection. */
+    internal fun getCurrentCreativeSourceForTesting(): String? = currentCreativeSource
+
+    /**
+     * Look up the source recorded at setCurrentAd time for a given adId.
+     * Returns null when no source was provided (legacy 2-arg setCurrentAd
+     * caller) or the adId is unknown. Consumed by AudienceSensingService
+     * at drain time to stamp creative_source onto each emitted per_face row.
+     */
+    fun getSourceFor(adId: String): String? = adIdToSource[adId]
+
+    /**
+     * Drain accumulated per-(adId, faceId) attention buckets. Called from
+     * [AudienceSensingService] at window flush time. Returns the
+     * finalize()'d snapshot AND clears internal state so the next window
+     * starts fresh. Idempotent — calling twice in a row returns
+     * accumulations from the second window only (empty if no frames
+     * accumulated in between).
+     *
+     * Map layout: outer key = adId, inner key = ML Kit face track ID.
+     */
+    fun drainPerAdAttention(): Map<String, Map<Int, PerFaceAttention>> {
+        // Phase 1c — pre-fetch the per-face age/gender overlay so the
+        // drain populates ageBucket / gender on each bucket before the
+        // window resets. Snapshot ONCE — the underlying map is concurrent.
+        val ageGenderOverlay: Map<Int, AgeGenderResult> =
+            ageGenderProcessor?.getPerFaceLatestSnapshot() ?: emptyMap()
+
+        val snapshot = mutableMapOf<String, Map<Int, PerFaceAttention>>()
+        // Snapshot keys first to avoid holding the iterator under modification
+        val adKeys = perAdAttention.keys.toList()
+        for (adKey in adKeys) {
+            val inner = perAdAttention.remove(adKey) ?: continue
+            val finalized = mutableMapOf<Int, PerFaceAttention>()
+            for ((faceId, attention) in inner) {
+                ageGenderOverlay[faceId]?.let { ag ->
+                    attention.ageBucket = ag.ageRange
+                    attention.gender = ag.gender
+                }
+                finalized[faceId] = attention.finalize()
+            }
+            if (finalized.isNotEmpty()) snapshot[adKey] = finalized
+        }
+        // Reset frame-interval anchor — next window starts a fresh cadence.
+        lastPerFaceSampleMs = 0L
+        // adIdToSource is NOT cleared here — drainPerAdAttention returns
+        // the per-face map and the caller looks up creative_source per adId
+        // via getSourceFor() AFTER drain returns. Lifetime of the source
+        // map is bounded by unique creative count per device (~10-100), so
+        // memory pressure is negligible. If we cleared here, the very next
+        // getSourceFor() call would return null.
+        return snapshot
+    }
+
+    /**
+     * Accumulate a per-frame sample into the (currentAdId, faceId) bucket.
+     *
+     * No-op when [currentAdId] is null (no ad playing during this frame) —
+     * idle frames don't contribute to per-ad attention. Per-face samples
+     * arrive from the per-frame [processEmotionalEngagementZeroAlloc] path
+     * (collapse points #1 and #2 in P0a audit). The `frameIntervalMs`
+     * value translates each sample into dwell-seconds and gaze-seconds.
+     */
+    internal fun accumulatePerFaceSample(
+        faceId: Int,
+        nowMs: Long,
+        attentionScore: Float,
+        gazeAttentionScore: Float,
+        isLookingAtScreen: Boolean,
+        focusRegion: Int,
+        emotion: EmotionType,
+        emotionConfidence: Float,
+        frameIntervalMs: Long,
+    ) {
+        val adId = currentAdId ?: return
+        val inner = perAdAttention.computeIfAbsent(adId) {
+            java.util.concurrent.ConcurrentHashMap()
+        }
+        val bucket = inner.computeIfAbsent(faceId) { PerFaceAttention() }
+        synchronized(bucket) {
+            bucket.addSample(
+                nowMs = nowMs,
+                attentionScore = attentionScore,
+                gazeAttentionScore = gazeAttentionScore,
+                isLookingAtScreen = isLookingAtScreen,
+                focusRegion = focusRegion,
+                emotion = emotion,
+                emotionConfidence = emotionConfidence,
+                frameIntervalMs = frameIntervalMs,
+            )
+        }
+    }
+
+    /**
+     * Test-only / introspection: returns the count of (adId, faceId)
+     * buckets currently accumulated. Production code MUST use
+     * [drainPerAdAttention].
+     */
+    internal fun perAdAttentionBucketCountForTesting(): Int {
+        var n = 0
+        for ((_, inner) in perAdAttention) n += inner.size
+        return n
+    }
+
+    /**
+     * Test-only: returns a live reference to the inner per-face map for
+     * the given ad. Tests use this to assert intermediate accumulator
+     * state without draining the production map.
+     */
+    internal fun peekPerFaceMapForTesting(adId: String): Map<Int, PerFaceAttention>? {
+        return perAdAttention[adId]
     }
 
     /**
@@ -1846,40 +2481,6 @@ class AudienceAnalyzer(
         )
     }
 
-    private fun checkReportInterval() {
-        val now = System.currentTimeMillis()
-        if (now - lastReportTime >= config.reportIntervalMs) {
-            generateAndSendReport()
-            lastReportTime = now
-        }
-    }
-
-    private fun generateAndSendReport() {
-        val snapshot = _currentSnapshot.value
-        val intervalMs = System.currentTimeMillis() - lastReportTime
-
-        val payload = AudienceMetricsPayload(
-            screenId = null,  // Will be filled in by the service
-            fingerprint = "",  // Will be filled in by the service
-            timestamp = snapshot.timestamp,
-            intervalMs = intervalMs,
-            viewerCount = snapshot.viewerCount,
-            personCount = snapshot.personCount,
-            peakViewerCount = peakViewerCount,
-            attentionScore = snapshot.attentionScore,
-            demographics = snapshot.demographics,
-            dwellTime = snapshot.dwellTime,
-            environment = snapshot.environment
-        )
-
-        // Reset peak for next interval
-        peakViewerCount = snapshot.viewerCount
-
-        analyzerScope.launch {
-            onMetricsReady?.invoke(payload)
-        }
-    }
-
     /**
      * Get current viewer count.
      */
@@ -1889,6 +2490,20 @@ class AudienceAnalyzer(
      * Get current person count from the local TFLite detector.
      */
     fun getCurrentPersonCount(): Int = currentPersonCount
+
+    /**
+     * Get vehicle flow metrics from the live VehicleFlowProcessor window.
+     * Returns null when object detection is not active (model absent or disabled).
+     */
+    fun getVehicleFlowMetrics(): VehicleFlowProcessor.FlowMetrics? =
+        if (objectDetector?.isReady() == true) vehicleFlowProcessor.getFlowMetrics() else null
+
+    /**
+     * Get queue estimation metrics from the live QueueEstimationProcessor window.
+     * Returns null when object detection is not active (model absent or disabled).
+     */
+    fun getQueueMetrics(): QueueEstimationProcessor.QueueMetrics? =
+        if (objectDetector?.isReady() == true) queueEstimationProcessor.getQueueMetrics() else null
 
     /**
      * Get current attention score (0.0 to 1.0).
@@ -1922,9 +2537,118 @@ class AudienceAnalyzer(
     fun getAgeGenderProcessor(): AgeGenderProcessor? = ageGenderProcessor
 
     /**
-     * Get the gaze tracking processor for creative zone data.
+     * Whether the FaceLandmarker (emotion + gaze + head-pose source) is
+     * currently loaded. Used by AudienceSensingService to gate the
+     * `creativeZones` heatmap emission.
      */
-    fun getGazeProcessor(): GazeTrackingProcessor? = gazeProcessor
+    fun isFaceLandmarkerActive(): Boolean = faceLandmarkerProcessor != null
+
+    /**
+     * Snapshot the per-zone dwell-time distribution for the current report
+     * window. Zones are 0..8 indices into the 3×3 viewport grid (4 == center).
+     * Returns an empty map when no gaze samples accumulated since the last
+     * reset. Zone bookkeeping is updated by processEmotionalEngagementZeroAlloc
+     * from each frame's FaceLandmarker focusRegion.
+     *
+     * Replaces the legacy GazeTrackingProcessor.getZoneDistribution().
+     */
+    fun getGazeZoneDistribution(): Map<Int, Float> {
+        synchronized(zoneDwellMs) {
+            // Flush the active zone's pending dwell so the snapshot reflects
+            // ms accumulated up to "now" rather than only since the last
+            // updateZoneDwell() call.
+            val now = System.currentTimeMillis()
+            if (lastZoneChangeMs > 0 && currentZone in 0..8) {
+                val pending = (now - lastZoneChangeMs).coerceAtMost(10_000L)
+                zoneDwellMs[currentZone] += pending
+                lastZoneChangeMs = now
+            }
+
+            val totalMs = zoneDwellMs.sum()
+            if (totalMs == 0L) return emptyMap()
+
+            return (0 until 9)
+                .filter { zoneDwellMs[it] > 0 }
+                .associateWith { zoneDwellMs[it].toFloat() / totalMs.toFloat() }
+        }
+    }
+
+    /**
+     * Reset zone-dwell accumulators at the end of a report window.
+     * Replaces the legacy GazeTrackingProcessor.resetZoneDwell().
+     */
+    fun resetZoneDwell() {
+        synchronized(zoneDwellMs) {
+            zoneDwellMs.fill(0)
+            lastZoneChangeMs = System.currentTimeMillis()
+            currentZone = 4
+        }
+    }
+
+    /**
+     * Track time spent in each gaze zone. Called from
+     * processEmotionalEngagementZeroAlloc with the dominant face's focusRegion
+     * each frame. Caps individual dwell at 10s to avoid stale data from paused
+     * processing windows.
+     */
+    private fun updateZoneDwell(newZone: Int) {
+        if (newZone !in 0..8) return
+        synchronized(zoneDwellMs) {
+            val now = System.currentTimeMillis()
+            if (lastZoneChangeMs > 0 && currentZone in 0..8) {
+                val dwellMs = now - lastZoneChangeMs
+                zoneDwellMs[currentZone] += dwellMs.coerceAtMost(10_000L)
+            }
+            currentZone = newZone
+            lastZoneChangeMs = now
+        }
+    }
+
+    /**
+     * Pure aggregation over per-frame gaze snapshots — replaces the legacy
+     * GazeTrackingProcessor.aggregateMetrics() which had no instance state.
+     */
+    private fun aggregateGazeSnapshots(samples: List<GazeMetrics>): AggregatedGazeMetrics {
+        if (samples.isEmpty()) return AggregatedGazeMetrics()
+
+        val windowStart = samples.minOfOrNull { it.timestamp } ?: 0
+        val windowEnd = samples.maxOfOrNull { it.timestamp } ?: 0
+
+        val regionCounts = samples
+            .filter { it.isLookingAtScreen }
+            .groupBy { it.focusRegion }
+            .mapValues { it.value.size }
+
+        val primaryRegion = regionCounts.maxByOrNull { it.value }?.key ?: 4
+
+        val lookingCount = samples.count { it.isLookingAtScreen }
+        val lookingAtScreenPct = lookingCount.toFloat() / samples.size
+
+        val avgStability = samples
+            .filter { it.isLookingAtScreen }
+            .map { it.gazeStability }
+            .takeIf { it.isNotEmpty() }
+            ?.average()
+            ?.toFloat() ?: 0f
+
+        val totalLooking = lookingCount.coerceAtLeast(1)
+        val heatmap = (0 until 9).associateWith { region ->
+            (regionCounts[region] ?: 0).toFloat() / totalLooking
+        }
+
+        val avgAttention = samples.map { it.attentionScore }.average().toFloat()
+
+        return AggregatedGazeMetrics(
+            windowStart = windowStart,
+            windowEnd = windowEnd,
+            sampleCount = samples.size,
+            primaryFocusRegion = primaryRegion,
+            lookingAtScreenPct = lookingAtScreenPct,
+            avgGazeStability = avgStability,
+            regionHeatmap = heatmap,
+            gazeAttentionScore = avgAttention
+        )
+    }
 
     /**
      * Get mode of recent gaze focus regions.
@@ -1944,57 +2668,6 @@ class AudienceAnalyzer(
             .groupBy { it }
             .maxByOrNull { it.value.size }
             ?.key ?: 4
-    }
-
-    /**
-     * Get last emotion classification scores for gradient computation.
-     * Returns the most recent emotion probability distribution, or null if unavailable.
-     */
-    fun getLastEmotionScores(): FloatArray? {
-        val recentEmotions: List<EmotionMetrics>
-        synchronized(emotionMetricsBuffer) {
-            recentEmotions = emotionMetricsBuffer.toList()
-        }
-        if (recentEmotions.isEmpty()) return null
-
-        val last = recentEmotions.last()
-        // Return emotion scores as: [happy, surprised, neutral, sad, angry, disgusted, confused]
-        return floatArrayOf(
-            last.happyScore,
-            last.surprisedScore,
-            last.neutralScore,
-            last.sadScore,
-            last.angryScore,
-            last.disgustScore,
-            if (last.dominantEmotion == EmotionType.CONFUSED) last.emotionConfidence else 0f
-        )
-    }
-
-    /**
-     * Get self-supervised emotion pseudo-labels from engagement feedback.
-     * Uses engagement score as a soft label: high engagement = positive emotions likely correct.
-     */
-    fun getEmotionPseudoLabels(): FloatArray? {
-        val recentEmotions: List<EmotionMetrics>
-        synchronized(emotionMetricsBuffer) {
-            recentEmotions = emotionMetricsBuffer.toList()
-        }
-        if (recentEmotions.isEmpty()) return null
-
-        // Average emotion distribution from recent samples as pseudo-labels
-        val counts = FloatArray(7) // [happy, surprised, neutral, sad, angry, disgusted, confused]
-        val emotionTypes = listOf(EmotionType.HAPPY, EmotionType.SURPRISED, EmotionType.NEUTRAL,
-            EmotionType.SAD, EmotionType.ANGRY, EmotionType.DISGUSTED, EmotionType.CONFUSED)
-
-        for (em in recentEmotions) {
-            val idx = emotionTypes.indexOf(em.dominantEmotion)
-            if (idx >= 0) counts[idx] += 1f
-        }
-
-        // Normalize to probability distribution
-        val total = counts.sum()
-        if (total == 0f) return null
-        return FloatArray(7) { counts[it] / total }
     }
 
     /**
@@ -2032,57 +2705,47 @@ class AudienceAnalyzer(
         }
     }
 
-    fun stopEmotionDetection() {
-        runVisionMutation { stopEmotionDetectionInternal() }
-    }
+    // Emotion + gaze share one processor (FaceLandmarker) since Phase 3.
+    // The legacy stop/start emotion/gaze pairs are kept as public aliases so
+    // existing callers in AudienceSensingService (memory-attenuation tier
+    // transitions) continue to work; both names target the same lifecycle.
 
-    private fun stopEmotionDetectionInternal() {
-        emotionProcessor?.release()
-        emotionProcessor = null
-        refreshProcessorActivationState()
-        Log.d(TAG, "[Attenuation] Emotion detection stopped")
+    fun stopEmotionDetection() {
+        runVisionMutation { stopFaceLandmarkerInternal() }
     }
 
     fun startEmotionDetection() {
-        runVisionMutation { startEmotionDetectionInternal() }
-    }
-
-    private fun startEmotionDetectionInternal() {
-        // Close existing instance first to prevent native memory leaks
-        emotionProcessor?.release()
-        emotionProcessor = null
-        emotionProcessor = EmotionClassificationProcessor(context).apply {
-            if (hasModel() && initialize()) {
-                refreshProcessorActivationState()
-                Log.d(TAG, "[Attenuation] Emotion detection started")
-            } else {
-                Log.w(TAG, "[Attenuation] Emotion detection unavailable (model missing)")
-                emotionProcessor = null
-                refreshProcessorActivationState()
-            }
-        }
+        runVisionMutation { startFaceLandmarkerInternal() }
     }
 
     fun stopGazeTracking() {
-        runVisionMutation { stopGazeTrackingInternal() }
-    }
-
-    private fun stopGazeTrackingInternal() {
-        gazeProcessor?.reset()
-        gazeProcessor = null
-        refreshProcessorActivationState()
-        Log.d(TAG, "[Attenuation] Gaze tracking stopped")
+        runVisionMutation { stopFaceLandmarkerInternal() }
     }
 
     fun startGazeTracking() {
-        runVisionMutation { startGazeTrackingInternal() }
+        runVisionMutation { startFaceLandmarkerInternal() }
     }
 
-    private fun startGazeTrackingInternal() {
-        if (gazeProcessor == null) {
-            gazeProcessor = GazeTrackingProcessor()
-            refreshProcessorActivationState()
-            Log.d(TAG, "[Attenuation] Gaze tracking started")
+    private fun stopFaceLandmarkerInternal() {
+        if (faceLandmarkerProcessor == null) return
+        faceLandmarkerProcessor?.release()
+        faceLandmarkerProcessor = null
+        resetZoneDwell()
+        refreshProcessorActivationState()
+        Log.d(TAG, "[Attenuation] FaceLandmarker (emotion + gaze + head-pose) stopped")
+    }
+
+    private fun startFaceLandmarkerInternal() {
+        if (faceLandmarkerProcessor != null) return
+        faceLandmarkerProcessor = FaceLandmarkerProcessor(context).apply {
+            if (initialize()) {
+                refreshProcessorActivationState()
+                Log.d(TAG, "[Attenuation] FaceLandmarker (emotion + gaze + head-pose) started")
+            } else {
+                Log.w(TAG, "[Attenuation] FaceLandmarker init failed; emotion/gaze unavailable")
+                faceLandmarkerProcessor = null
+                refreshProcessorActivationState()
+            }
         }
     }
 
@@ -2136,7 +2799,9 @@ class AudienceAnalyzer(
         personDetector?.release()
         personDetector = null
         currentPersonCount = 0
-        Log.d(TAG, "[Attenuation] Person detection stopped")
+        objectDetector?.release()
+        objectDetector = null
+        Log.d(TAG, "[Attenuation] Person + object detection stopped")
     }
 
     fun startPersonDetection() {
@@ -2154,6 +2819,19 @@ class AudienceAnalyzer(
             pdCandidate.release()
             Log.w(TAG, "[Attenuation] Person detection unavailable (model missing)")
         }
+
+        objectDetector?.release()
+        objectDetector = null
+        val odCandidate = ObjectDetectionProcessor(context)
+        if (odCandidate.hasModel() && odCandidate.initialize()) {
+            objectDetector = odCandidate
+            vehicleFlowProcessor.reset()
+            queueEstimationProcessor.reset()
+            Log.d(TAG, "[Attenuation] Multi-class object detection started")
+        } else {
+            odCandidate.release()
+            Log.w(TAG, "[Attenuation] Object detection unavailable (model missing)")
+        }
     }
 
     fun applyVisionProcessorSelection(selection: VisionProcessorSelection) {
@@ -2170,16 +2848,13 @@ class AudienceAnalyzer(
                 stopPoseDetectionInternal()
             }
 
-            if (selection.wantsEmotion) {
-                if (emotionProcessor == null) startEmotionDetectionInternal()
-            } else if (emotionProcessor != null) {
-                stopEmotionDetectionInternal()
-            }
-
-            if (selection.wantsGaze) {
-                if (gazeProcessor == null) startGazeTrackingInternal()
-            } else if (gazeProcessor != null) {
-                stopGazeTrackingInternal()
+            // Emotion + gaze are produced by a single FaceLandmarker forward
+            // pass; one lifecycle covers both `wants` flags.
+            val wantsFaceLandmarker = selection.wantsEmotion || selection.wantsGaze
+            if (wantsFaceLandmarker) {
+                if (faceLandmarkerProcessor == null) startFaceLandmarkerInternal()
+            } else if (faceLandmarkerProcessor != null) {
+                stopFaceLandmarkerInternal()
             }
 
             if (selection.wantsAgeGender) {

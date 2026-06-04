@@ -10,7 +10,6 @@ private val CAMERA_PROFILE_MODELS = setOf(
     "movenet",
     "efficientdet",
     "yolov8_nano",
-    "gemma_3n_e2b",
     "gemma_4_e2b",
     "moondream_05b",
     "smolvlm_256m"

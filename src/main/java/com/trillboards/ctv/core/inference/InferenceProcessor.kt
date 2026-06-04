@@ -7,7 +7,7 @@ package com.trillboards.ctv.core.inference
  * - [CAMERA] — PersonDetection, ObjectDetection, Emotion, Pose, AgeGender, GazeTracking
  * - [MICROPHONE] — AudioClassification (YAMNet), SpeechIntelligence (Moonshine)
  * - [CAMERA_AND_MICROPHONE] — future multi-modal processors (VLM with audio context)
- * - [NONE] — processors that work on pre-computed data (e.g., InsightExtractor)
+ * - [NONE] — processors that work on pre-computed data (e.g., post-aggregation enrichment)
  */
 enum class HardwareRequirement {
     CAMERA,
@@ -47,10 +47,9 @@ enum class HardwareRequirement {
  * ## Existing Processors (NOT retrofitted in this PR)
  * - PersonDetectionProcessor (efficientdet) — CAMERA
  * - ObjectDetectionProcessor (efficientdet) — CAMERA
- * - EmotionClassificationProcessor (fer_plus) — CAMERA
+ * - FaceLandmarkerProcessor (fer_plus emotion + iris gaze + head pose) — CAMERA
  * - PoseEngagementProcessor (movenet) — CAMERA
  * - AgeGenderProcessor (age_gender) — CAMERA
- * - GazeTrackingProcessor (blazeface) — CAMERA
  * - AudioClassificationProcessor (yamnet) — MICROPHONE
  * - SpeechIntelligenceProcessor (whisper_tiny) — MICROPHONE
  */

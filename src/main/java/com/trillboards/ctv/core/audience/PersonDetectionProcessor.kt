@@ -6,11 +6,14 @@ import android.util.Log
 import com.trillboards.ctv.core.SensingConfig
 import com.trillboards.ctv.core.inference.DelegateSelector
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
+import java.nio.ByteBuffer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -142,18 +145,54 @@ class PersonDetectionProcessor(
     /**
      * Process a single frame bitmap and count persons.
      *
-     * @param bitmap The camera frame in-memory bitmap.
+     * IMPORTANT: MediaPipe's `BitmapImageContainer.close()` (called via
+     * `mpImage.close()`) calls `recycle()` on the source bitmap. If we passed
+     * the caller's bitmap directly, it would be recycled out from under the
+     * caller — which is the AudienceAnalyzer's pre-allocated zero-alloc
+     * sharedBitmap. That broke the entire zero-allocation frame pipeline:
+     * every frame's `imageProxyToSharedBitmap` saw a recycled bitmap, called
+     * `releaseBuffers` + `initializeBuffers` (allocating a fresh 512×384
+     * ARGB_8888 Bitmap = ~786 KB per frame at 5–10 Hz, ~4–8 MB/sec of GC
+     * churn), and AgeGenderProcessor.hasFaces() never accumulated because
+     * the face crop bitmap also got reallocated each frame.
+     *
+     * Fix: pass a defensive copy to MediaPipe. The copy gets recycled by
+     * mpImage.close(); the caller's bitmap stays alive for the next frame.
+     * The per-call Bitmap.copy() is ~786 KB at typical 512×384 ARGB_8888,
+     * which is well under the per-call inference cost and far less than
+     * the GC churn the old (broken) zero-alloc path was paying.
+     *
+     * @param bitmap The camera frame in-memory bitmap (NOT recycled by this call).
      * @return Number of persons detected.
      */
     fun process(bitmap: Bitmap): Int {
         if (!isInitialized || objectDetector == null) return 0
 
         return try {
-            val mpImage = BitmapImageBuilder(bitmap).build()
+            val frameCopy = try {
+                bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to copy bitmap for person detection: ${e.message}")
+                return 0
+            }
+
             val result = try {
-                objectDetector?.detect(mpImage)
+                val mpImage = BitmapImageBuilder(frameCopy).build()
+                try {
+                    objectDetector?.detect(mpImage)
+                } finally {
+                    // mpImage.close() calls BitmapImageContainer.close() which
+                    // calls frameCopy.recycle(). The shared bitmap is unaffected
+                    // because we passed a copy.
+                    mpImage.close()
+                }
             } finally {
-                mpImage.close()
+                // Defensive: if MediaPipe's BitmapImageContainer ever stops
+                // recycling on close (API change), recycle the throwaway here
+                // so we don't leak the 786 KB per call.
+                if (!frameCopy.isRecycled) {
+                    frameCopy.recycle()
+                }
             }
 
             val count = result?.detections()?.size ?: 0
@@ -166,6 +205,41 @@ class PersonDetectionProcessor(
             count
         } catch (e: Exception) {
             Log.e(TAG, "Error during person detection inference", e)
+            0
+        }
+    }
+
+    /**
+     * Zero-allocation variant of [process] using a caller-owned RGB ByteBuffer.
+     *
+     * [ByteBufferImageBuilder] wraps the buffer without copying and `close()` frees
+     * only the wrapper, so unlike [process] — which pays a per-frame `Bitmap.copy()`
+     * (~786 KB) because [BitmapImageBuilder] recycles its source — this allocates
+     * nothing per frame. Output is identical to [process] (same detector, count).
+     *
+     * @param rgbByteBuffer Pre-filled RGB bytes (3 per pixel, 0-255); width*height*3.
+     * @return Number of persons detected.
+     */
+    fun processWithBuffer(rgbByteBuffer: ByteBuffer, width: Int, height: Int): Int {
+        if (!isInitialized || objectDetector == null) return 0
+
+        return try {
+            rgbByteBuffer.rewind()
+            val mpImage = ByteBufferImageBuilder(
+                rgbByteBuffer, width, height, MPImage.IMAGE_FORMAT_RGB
+            ).build()
+            val result = try {
+                objectDetector?.detect(mpImage)
+            } finally {
+                // Frees only the MPImage wrapper — the caller's buffer survives.
+                mpImage.close()
+            }
+
+            val count = result?.detections()?.size ?: 0
+            _currentPersonCount.value = count
+            count
+        } catch (e: Exception) {
+            Log.e(TAG, "processWithBuffer error: ${e.message}", e)
             0
         }
     }

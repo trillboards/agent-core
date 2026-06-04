@@ -133,13 +133,16 @@ class QueueEstimationProcessor {
 
     /**
      * Convert metrics to JSON for the audience signal payload.
+     * Keys use registry-canonical snake_case so chipPersistence.sanitizeFieldKey
+     * is idempotent on canonical input.
      */
     fun toJson(metrics: QueueMetrics): JSONObject {
         return JSONObject().apply {
-            put("estimatedQueueLength", metrics.estimatedQueueLength)
-            put("estimatedWaitTimeMinutes", metrics.estimatedWaitTimeMinutes)
-            put("serviceRatePerMinute", metrics.serviceRatePerMinute)
-            put("isQueueDetected", metrics.isQueueDetected)
+            put("pedestrian_count", metrics.estimatedQueueLength)
+            put("queue_length", metrics.estimatedQueueLength)
+            put("estimated_wait_time_minutes", metrics.estimatedWaitTimeMinutes)
+            put("service_rate_per_minute", metrics.serviceRatePerMinute)
+            put("queue_detected", metrics.isQueueDetected)
             put("trend", metrics.trend)
         }
     }

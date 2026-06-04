@@ -42,7 +42,7 @@ data class PushFleetCommandRequestCommand (
     /**
      * 
      *
-     * Values: RELOAD,UPDATE_SETTINGS,RESTART,SCREENSHOT,CLEAR_CACHE,UPDATE_CONTENT,REFRESH_ADS,UPDATE_CONFIG,GET_STATE
+     * Values: RELOAD,UPDATE_SETTINGS,RESTART,SCREENSHOT,CLEAR_CACHE,UPDATE_CONTENT,REFRESH_ADS,UPDATE_CONFIG,GET_STATE,SHOW_AD,PLAY_AD
      */
     @Serializable
     enum class Type(val value: kotlin.String) {
@@ -54,7 +54,9 @@ data class PushFleetCommandRequestCommand (
         @SerialName(value = "update_content") UPDATE_CONTENT("update_content"),
         @SerialName(value = "refresh_ads") REFRESH_ADS("refresh_ads"),
         @SerialName(value = "update_config") UPDATE_CONFIG("update_config"),
-        @SerialName(value = "get_state") GET_STATE("get_state");
+        @SerialName(value = "get_state") GET_STATE("get_state"),
+        @SerialName(value = "show_ad") SHOW_AD("show_ad"),
+        @SerialName(value = "play_ad") PLAY_AD("play_ad");
     }
 
 }

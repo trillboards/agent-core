@@ -19,9 +19,9 @@ sealed class InferenceInput {
     /**
      * A single camera frame for vision-based processors.
      *
-     * Matches the pattern used by PersonDetectionProcessor, EmotionClassificationProcessor,
-     * PoseEngagementProcessor, AgeGenderProcessor, ObjectDetectionProcessor, and
-     * GazeTrackingProcessor — all of which accept a Bitmap per frame.
+     * Matches the pattern used by PersonDetectionProcessor, FaceLandmarkerProcessor,
+     * PoseEngagementProcessor, AgeGenderProcessor, and ObjectDetectionProcessor —
+     * all of which accept a Bitmap per frame.
      *
      * @param bitmap In-memory camera frame. Never stored or transmitted.
      * @param timestamp Capture timestamp in milliseconds (SystemClock or epoch).

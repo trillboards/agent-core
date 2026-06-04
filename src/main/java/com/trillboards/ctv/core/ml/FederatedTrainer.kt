@@ -21,6 +21,7 @@ import java.security.spec.X509EncodedKeySpec
 import android.util.Base64
 import kotlinx.coroutines.*
 import kotlin.math.abs
+import kotlin.math.exp
 import java.util.Locale
 import java.util.Calendar
 
@@ -78,6 +79,35 @@ class FederatedTrainer(
         private const val PREF_PUBLIC_KEY = "vas_public_key"
         private const val PREF_KEY_ID = "vas_key_id"
 
+        // ─── FEIN screen-taste constants ─────────────────────────────────
+        // Hard-coded mirror of `@trillboards/iab-taxonomy/fein-constants`
+        // (data/fein-constants.cjs). The TS parity test in that package
+        // pins src/fein.ts <-> data/fein-constants.cjs; this Kotlin block is
+        // the third surface and MUST stay in sync. Drift is caught by the
+        // Phase-7 cross-language conformance fixture (deferred work).
+        const val AUDIENCE_VECTOR_DIM = 64
+        const val SCREEN_TASTE_DIM = 64
+        const val SGD_LEARNING_RATE = 0.01f
+        const val SGD_STEP_EVERY_N_AD_COMPLETIONS = 20
+        const val PRIOR_BLEND_ALPHA_INITIAL = 0.3f
+
+        // Persistence keys for the per-screen taste embedding. The taste
+        // vector + meta lives in EncryptedSharedPreferences alongside the
+        // VAS attestation keypair so a single secure-store handle covers
+        // both. Stored as a comma-separated float string for portability
+        // (avoids JSON parse cost on hot path; debounced write means the
+        // serialization cost is amortized).
+        const val PREF_SCREEN_TASTE = "screen_taste_vector"
+        const val PREF_TASTE_VERSION = "screen_taste_version"
+        const val PREF_TASTE_SAMPLE_COUNT = "screen_taste_sample_count"
+        const val PREF_TASTE_UPDATED_AT = "screen_taste_updated_at"
+
+        // Debounce window for write-back of taste state to encrypted prefs.
+        // Each SGD step is a small in-place mutation; serializing 64 floats
+        // every step would be wasteful. 5 seconds covers the realistic
+        // burst of N=20-step SGD events while keeping crash-loss bounded.
+        private const val TASTE_PERSIST_DEBOUNCE_MS = 5_000L
+
         /**
          * Compute current daypart from hour of day.
          * morning: 6-11, afternoon: 12-16, evening: 17-21, late_night: 22-5
@@ -113,6 +143,32 @@ class FederatedTrainer(
     private val localAdaptationBuffer = mutableMapOf<String, MutableList<FloatArray>>()
     private val localAdaptationMaxSize = 100
 
+    // ─── Screen-taste embedding state (FEIN P2 + P3) ─────────────────────
+    //
+    // Per-screen 64-dim taste vector. Lazy-init: starts null, populated
+    // either by Phase 2's `sgdStep()` (zeros on first step, then SGD-
+    // updated in place) OR by Phase 3's `setScreenTaste()` (overwritten
+    // from a cloud-uploaded vector). Debounced writes persist it to
+    // EncryptedSharedPreferences so a re-hydration on construction picks
+    // up where the last SGD step left off.
+    //
+    // Mutations of `screenTaste` are guarded by `lock` (shared with the
+    // existing gradient buffers — same I/O contention surface).
+    @Volatile private var screenTaste: FloatArray? = null
+    // Phase 2 SGD counters (local-side):
+    @Volatile private var tasteVersion: Int = 0
+    @Volatile private var tasteSampleCount: Int = 0
+    @Volatile private var tasteUpdatedAtMs: Long = 0L
+
+    // Debounce bookkeeping for taste-state writeback. `lastTastePersistMs`
+    // tracks the wall-clock time of the most recent successful write so
+    // back-to-back SGD steps coalesce into a single flush.
+    @Volatile private var lastTastePersistMs: Long = 0L
+
+    // Phase 3 upload bookkeeping (set by setScreenTaste from the FedAvg loop):
+    @Volatile private var screenTasteSampleCount: Int = 0
+    @Volatile private var screenTasteVersionHash: String? = null
+
     // Ed25519 key pair for VAS attestation (requires API 33+)
     private var attestationKeyPair: KeyPair? = null
     var publicKeyId: String? = null
@@ -120,6 +176,7 @@ class FederatedTrainer(
 
     init {
         initAttestationKeys()
+        loadScreenTasteFromPrefs()
     }
 
     /**
@@ -228,6 +285,284 @@ class FederatedTrainer(
         }
     }
 
+    // ─── Screen-taste SGD (FEIN P2) ───────────────────────────────────────
+    //
+    // The per-screen taste embedding is a 64-dim vector learned by online
+    // SGD on the (audience_emb ⊙ creative_emb) -> target_score signal. The
+    // math is intentionally hand-rolled (no TFLite training graph) so the
+    // CTV and the TS edge-federated mirror can stay bit-aligned without a
+    // model-binary cross-language conformance step.
+    //
+    // Forward:
+    //   z = taste · (audience_emb ⊙ creative_emb)
+    //   affinity_pred = sigmoid(z)
+    // Loss (per-sample MSE):
+    //   L = (affinity_pred - target)^2
+    // Gradient wrt taste (via the chain rule, sigmoid' = sigmoid * (1-sigmoid)):
+    //   dL/dz       = 2 * (affinity_pred - target) * sigmoid'(z)
+    //   dL/d_taste  = dL/dz * (audience_emb ⊙ creative_emb)
+    // Update:
+    //   taste <- taste - η * dL/d_taste,   η = SGD_LEARNING_RATE = 0.01
+    //
+    // Phase 2 stages the math: callers pass `targetScore` directly. The
+    // actual training signal (`vas_weighted` from `attention_ledger`) is
+    // wired in Phase 3 alongside the upload of the resulting taste vector
+    // into the existing `federated_model_slices` aggregator path.
+
+    /**
+     * Perform one SGD step on the screen-taste embedding.
+     *
+     * @param audienceEmb 64-dim audience context vector
+     *                    (output of [audienceLookalikeService.audienceToVector]).
+     * @param creativeEmb 64-dim creative-content embedding vector.
+     * @param targetScore Observed affinity in [0, 1] — the per-completion
+     *                    label the cloud will start emitting in Phase 3
+     *                    (e.g. `vas_weighted` normalized into [0,1]).
+     *
+     * Mutates [screenTaste] in place, advances [tasteSampleCount], and
+     * schedules a debounced persistence write. Validates input dimensions;
+     * silently no-ops on a mismatch so a misbehaving caller cannot crash
+     * the pipeline.
+     */
+    fun sgdStep(audienceEmb: FloatArray, creativeEmb: FloatArray, targetScore: Float) {
+        if (audienceEmb.size != SCREEN_TASTE_DIM ||
+            creativeEmb.size != SCREEN_TASTE_DIM) {
+            Log.w(
+                TAG,
+                "sgdStep dimension mismatch: audience=${audienceEmb.size} " +
+                    "creative=${creativeEmb.size} expected=$SCREEN_TASTE_DIM"
+            )
+            return
+        }
+
+        // Pre-compute the Hadamard product (audience_emb ⊙ creative_emb).
+        // This is also the gradient direction wrt taste (up to the scalar
+        // dL/dz factor), so we re-use it below without a second allocation.
+        val hadamard = FloatArray(SCREEN_TASTE_DIM) { audienceEmb[it] * creativeEmb[it] }
+
+        synchronized(lock) {
+            // Lazy-init: first SGD step on a fresh trainer (no prior, no
+            // setScreenTaste) seeds the vector to zeros. Mirrors the TS
+            // canonical's first-touch behavior.
+            val taste = screenTaste ?: FloatArray(SCREEN_TASTE_DIM) { 0f }.also {
+                screenTaste = it
+            }
+
+            // Forward pass: z = taste · hadamard
+            var z = 0f
+            for (i in 0 until SCREEN_TASTE_DIM) {
+                z += taste[i] * hadamard[i]
+            }
+            val pred = sigmoid(z)
+            val sigDeriv = pred * (1f - pred)  // sigmoid'(z)
+            val dLdZ = 2f * (pred - targetScore) * sigDeriv
+
+            // taste <- taste - η * dL/dz * hadamard[i]
+            val step = SGD_LEARNING_RATE * dLdZ
+            for (i in 0 until SCREEN_TASTE_DIM) {
+                taste[i] -= step * hadamard[i]
+            }
+
+            tasteSampleCount += 1
+            tasteUpdatedAtMs = System.currentTimeMillis()
+        }
+
+        maybePersistTaste()
+    }
+
+    /**
+     * Blend a fleet-FedAvg prior into the local taste embedding.
+     *
+     * Used on cold-start (Phase 3 OTA path) to seed the per-screen taste
+     * vector with a slice-level prior before local SGD takes over.
+     *
+     * @param prior The prior vector (must be [SCREEN_TASTE_DIM]).
+     * @param alpha Mixing weight for the prior — 0 keeps local, 1 replaces.
+     *              Defaults to [PRIOR_BLEND_ALPHA_INITIAL] (0.3) so cold
+     *              screens lean toward the prior while warm screens that
+     *              call this preserve most of their own learnings.
+     *
+     * Silent no-op on dimension mismatch (same defensive posture as
+     * [sgdStep]).
+     */
+    fun applyPrior(prior: FloatArray, alpha: Float = PRIOR_BLEND_ALPHA_INITIAL) {
+        if (prior.size != SCREEN_TASTE_DIM) {
+            Log.w(
+                TAG,
+                "applyPrior dimension mismatch: prior=${prior.size} " +
+                    "expected=$SCREEN_TASTE_DIM"
+            )
+            return
+        }
+        val clampedAlpha = alpha.coerceIn(0f, 1f)
+        synchronized(lock) {
+            val current = screenTaste
+            if (current == null) {
+                // Cold-start: no local SGD state yet — seed directly from
+                // the prior so the very first ad request can use a non-zero
+                // taste vector.
+                screenTaste = prior.copyOf()
+                tasteUpdatedAtMs = System.currentTimeMillis()
+                Log.i(TAG, "applyPrior: seeded screen_taste state from server prior (alpha=$alpha)")
+            } else {
+                for (i in 0 until SCREEN_TASTE_DIM) {
+                    current[i] = (1f - clampedAlpha) * current[i] + clampedAlpha * prior[i]
+                }
+                tasteUpdatedAtMs = System.currentTimeMillis()
+                Log.i(TAG, "applyPrior: blended screen_taste with server prior (alpha=$alpha)")
+            }
+        }
+        // Prior blending is a meaningful state change — write immediately
+        // (no debounce) so a crash after a cold-start prior doesn't
+        // re-bootstrap from zeros on next launch.
+        persistTaste()
+    }
+
+    /**
+     * Immutable point-in-time view of the screen-taste embedding.
+     * Used by the upload flow (Phase 3) — separate snapshot so callers
+     * never observe mid-step taste mutations.
+     */
+    data class TasteSnapshot(
+        val version: Int,
+        val sampleCount: Int,
+        val taste: FloatArray,
+        val updatedAt: Long
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is TasteSnapshot) return false
+            return version == other.version &&
+                sampleCount == other.sampleCount &&
+                updatedAt == other.updatedAt &&
+                taste.contentEquals(other.taste)
+        }
+
+        override fun hashCode(): Int {
+            var result = version
+            result = 31 * result + sampleCount
+            result = 31 * result + updatedAt.hashCode()
+            result = 31 * result + taste.contentHashCode()
+            return result
+        }
+    }
+
+    /**
+     * Return a defensive copy of the current taste embedding + metadata.
+     */
+    fun snapshotTaste(): TasteSnapshot {
+        synchronized(lock) {
+            val current = screenTaste
+            val tasteCopy = current?.copyOf() ?: FloatArray(SCREEN_TASTE_DIM) { 0f }
+            return TasteSnapshot(
+                version = tasteVersion,
+                sampleCount = tasteSampleCount,
+                taste = tasteCopy,
+                updatedAt = tasteUpdatedAtMs
+            )
+        }
+    }
+
+    /**
+     * Sigmoid activation: σ(z) = 1 / (1 + e^-z).
+     * Internal — exposed via [sgdStep] for the forward pass.
+     */
+    private fun sigmoid(z: Float): Float {
+        return 1f / (1f + exp(-z.toDouble()).toFloat())
+    }
+
+    /**
+     * Re-hydrate the screen-taste embedding from EncryptedSharedPreferences.
+     * Called once from [init] — failure is logged and left at zeros so the
+     * trainer is always usable (a corrupt entry won't brick the SGD loop).
+     *
+     * Catches [Throwable] (not just [Exception]) because the Android-only
+     * `EncryptedSharedPreferences` chain can throw `NoClassDefFoundError` /
+     * `ExceptionInInitializerError` on JVM unit-test classpaths that lack
+     * the Android Keystore. The fallback path uses Context.getSharedPrefs
+     * which is mockable; this widening keeps the trainer constructible in
+     * both environments.
+     */
+    private fun loadScreenTasteFromPrefs() {
+        try {
+            val prefs = getKeyPreferences()
+            val serialized = prefs.getString(PREF_SCREEN_TASTE, null) ?: return
+            val parts = serialized.split(',')
+            if (parts.size != SCREEN_TASTE_DIM) {
+                Log.w(
+                    TAG,
+                    "Persisted screen_taste has wrong dim: ${parts.size} " +
+                        "expected=$SCREEN_TASTE_DIM — discarding"
+                )
+                return
+            }
+            val restored = FloatArray(SCREEN_TASTE_DIM)
+            for (i in 0 until SCREEN_TASTE_DIM) {
+                restored[i] = parts[i].toFloatOrNull() ?: 0f
+            }
+            screenTaste = restored
+            tasteVersion = prefs.getInt(PREF_TASTE_VERSION, 0)
+            tasteSampleCount = prefs.getInt(PREF_TASTE_SAMPLE_COUNT, 0)
+            tasteUpdatedAtMs = prefs.getLong(PREF_TASTE_UPDATED_AT, 0L)
+            Log.i(
+                TAG,
+                "Restored screen_taste: v=$tasteVersion samples=$tasteSampleCount " +
+                    "updatedAt=$tasteUpdatedAtMs"
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to load screen_taste from prefs: ${t.message}")
+        }
+    }
+
+    /**
+     * Persist the current screen-taste state if the debounce window has
+     * elapsed since the last write. Cheap fast-path; falls through to
+     * [persistTaste] when an actual write is due.
+     *
+     * Callers that need a guaranteed write (e.g. [applyPrior] after a
+     * cold-start prior blend) bypass this and call [persistTaste] directly.
+     */
+    private fun maybePersistTaste() {
+        val now = System.currentTimeMillis()
+        if (now - lastTastePersistMs < TASTE_PERSIST_DEBOUNCE_MS) return
+        persistTaste()
+    }
+
+    /**
+     * Write the current screen-taste state to EncryptedSharedPreferences.
+     *
+     * Always writes, regardless of the debounce window — the wrapper
+     * [maybePersistTaste] is the debounce decision point.
+     */
+    private fun persistTaste() {
+        val snapshot = synchronized(lock) {
+            // Copy under lock so we don't serialize mid-mutation. Bail out
+            // when there's no taste state yet — nothing to persist.
+            val current = screenTaste ?: return
+            Triple(current.copyOf(), tasteSampleCount, tasteUpdatedAtMs)
+        }
+        try {
+            val prefs = getKeyPreferences()
+            val builder = StringBuilder(SCREEN_TASTE_DIM * 12)
+            for (i in 0 until SCREEN_TASTE_DIM) {
+                if (i > 0) builder.append(',')
+                builder.append(snapshot.first[i].toString())
+            }
+            prefs.edit()
+                .putString(PREF_SCREEN_TASTE, builder.toString())
+                .putInt(PREF_TASTE_VERSION, tasteVersion)
+                .putInt(PREF_TASTE_SAMPLE_COUNT, snapshot.second)
+                .putLong(PREF_TASTE_UPDATED_AT, snapshot.third)
+                .apply()
+            lastTastePersistMs = System.currentTimeMillis()
+        } catch (t: Throwable) {
+            // See [loadScreenTasteFromPrefs] — same JVM-classpath catch
+            // widening so a missing Android Keystore stub never crashes
+            // the SGD hot path.
+            Log.w(TAG, "Failed to persist screen_taste: ${t.message}")
+        }
+    }
+
     fun accumulateGradients(modelType: String, predictions: FloatArray, labels: FloatArray) {
         if (predictions.size != labels.size || predictions.isEmpty()) return
 
@@ -298,7 +633,138 @@ class FederatedTrainer(
             }
         }
 
+        // Phase 3 — also ship the screen-taste embedding if Phase 2's SGD state
+        // is populated. Forward-compatible: when Phase 2 lands `snapshotTaste()`
+        // will be wired here directly; for now, `uploadScreenTaste()` no-ops
+        // when state is null.
+        uploadScope.launch {
+            try {
+                uploadScreenTaste()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to upload screen_taste embedding: ${e.message}")
+            }
+        }
+
         lastUploadTime = System.currentTimeMillis()
+    }
+
+    /**
+     * Phase 2 hook — populate the screen-taste embedding state. Called by the
+     * Phase 2 SGD step inside the aggregation window so that the next
+     * `uploadAllGradients()` tick ships the fresh vector to
+     * `POST /v1/federated/taste`.
+     *
+     * The vector MUST be length 64 (matches the canonical contract
+     * `FederatedApi.TasteUploadPayload` in
+     * `trillboard-api/validation/federatedSchemas.ts`); shorter/longer arrays
+     * are dropped on the floor so a misconfigured caller can't break the
+     * upload path.
+     */
+    fun setScreenTaste(embedding: FloatArray, sampleCount: Int, versionHash: String) {
+        if (embedding.size != 64) {
+            Log.w(TAG, "setScreenTaste rejected: vector length ${embedding.size} != 64")
+            return
+        }
+        synchronized(lock) {
+            screenTaste = embedding.copyOf()
+            screenTasteSampleCount = sampleCount
+            screenTasteVersionHash = versionHash
+        }
+    }
+
+    /**
+     * Upload the screen-taste embedding to `POST /v1/federated/taste`. No-ops
+     * when Phase 2's state is not populated (forward-compatible — Phase 3
+     * ships the transport, Phase 2 fills the state).
+     */
+    private fun uploadScreenTaste() {
+        val embedding: FloatArray
+        val sampleCount: Int
+        val versionHash: String
+        synchronized(lock) {
+            val current = screenTaste ?: return
+            if (screenTasteSampleCount < 1) return
+            embedding = current.copyOf()
+            sampleCount = screenTasteSampleCount
+            versionHash = screenTasteVersionHash ?: "unknown"
+            // Reset sample counter so the next window starts fresh; we leave
+            // the embedding in place so it can keep accumulating until the
+            // Phase 2 SGD step overwrites it.
+            screenTasteSampleCount = 0
+        }
+
+        val url = URL("$apiBaseUrl/v1/federated/taste")
+        val connection = url.openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.setRequestProperty("x-device-fingerprint", deviceFingerprint)
+            connection.connectTimeout = 30000
+            connection.readTimeout = 30000
+            connection.doOutput = true
+
+            val ctx = sliceContext
+            val timestamp = System.currentTimeMillis()
+            val signature = signTaste(embedding, sampleCount, versionHash, timestamp)
+            val body = JSONObject().apply {
+                put("screenId", deviceFingerprint)
+                put("screenMongoId", screenMongoId)
+                put("tasteEmbedding", JSONArray(embedding.toList()))
+                put("tasteVersionHash", versionHash)
+                put("tasteSampleCount", sampleCount)
+                put("venueType", ctx.venueType)
+                put("daypart", ctx.daypart)
+                put("geo", ctx.geo)
+                put("deviceProfile", ctx.deviceProfile)
+                put("fingerprint", deviceFingerprint)
+                put("publicKeyId", publicKeyId ?: "")
+                put("signature", signature ?: "")
+                put("timestamp", timestamp)
+            }
+
+            connection.outputStream.use { os ->
+                OutputStreamWriter(os).use { writer ->
+                    writer.write(body.toString())
+                    writer.flush()
+                }
+            }
+
+            val responseCode = connection.responseCode
+            if (responseCode == 200) {
+                Log.i(TAG, "Uploaded screen_taste embedding: 64 floats, $sampleCount samples")
+            } else {
+                Log.w(TAG, "screen_taste upload failed with status $responseCode")
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /**
+     * Sign the screen-taste payload with the device's Ed25519 attestation key.
+     * Payload format mirrors `signVAS`: short canonical string, signed bytes,
+     * base64 output. Returns null when the key pair isn't available.
+     */
+    private fun signTaste(
+        embedding: FloatArray,
+        sampleCount: Int,
+        versionHash: String,
+        timestamp: Long
+    ): String? {
+        val keyPair = attestationKeyPair ?: return null
+        if (Build.VERSION.SDK_INT < 33) return null
+        return try {
+            // Mirror Locale.US numeric formatting so signatures verify cross-locale.
+            val checksum = embedding.fold(0f) { acc, v -> acc + v }
+            val payload = "taste:${String.format(Locale.US, "%.6f", checksum)}|n:$sampleCount|h:$versionHash|ts:$timestamp|fp:$deviceFingerprint"
+            val signature = Signature.getInstance("Ed25519")
+            signature.initSign(keyPair.private)
+            signature.update(payload.toByteArray())
+            Base64.encodeToString(signature.sign(), Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Log.w(TAG, "screen_taste signing failed: ${e.message}")
+            null
+        }
     }
 
     /**
@@ -468,6 +934,20 @@ class FederatedTrainer(
                     "local_adaptation_size" to (localAdaptationBuffer[model]?.size ?: 0)
                 )
             }
+            // Surface screen-taste stats under the same per-modelType key
+            // shape so `getStats()["screen_taste"]` mirrors the gradient
+            // buffers. The upload-side counters (`buffered_windows`,
+            // `avg_loss`) stay at zero until Phase 3 wires the gradient
+            // path; the local-side counters are populated here.
+            stats["screen_taste"] = mapOf(
+                "buffered_windows" to 0,
+                "sample_count" to tasteSampleCount,
+                "avg_loss" to 0.0,
+                "model_version" to tasteVersion,
+                "local_adaptation_size" to (localAdaptationBuffer["screen_taste"]?.size ?: 0),
+                "taste_dim" to SCREEN_TASTE_DIM,
+                "taste_updated_at" to tasteUpdatedAtMs
+            )
         }
         stats["last_upload"] = lastUploadTime
         stats["has_attestation_key"] = attestationKeyPair != null

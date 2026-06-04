@@ -11,10 +11,13 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
@@ -40,6 +43,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import kotlinx.coroutines.launch
 import com.trillboards.ctv.core.AgentConfig as CoreAgentConfig
 import com.trillboards.ctv.core.DeviceIdentity
+import com.trillboards.ctv.core.INTENT_EDGE_AI_PERMISSION_PROMPT
 import com.trillboards.ctv.core.bridge.NativeDeviceBridge
 import com.trillboards.ctv.core.bridge.WebViewAdsRegistrar
 import com.trillboards.ctv.core.device.KioskLockManager
@@ -99,6 +103,127 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         // storms; TV's cooldown-guarded RUNNING_CRITICAL is safer for both
         // platforms. RUNNING_LOW is now ignored.
         private const val CACHE_CLEAR_COOLDOWN_MS = 5 * 60 * 1000L
+
+        /** Cooldown between system permission re-prompts on `onResume` when CAMERA / RECORD_AUDIO are denied. */
+        const val EDGE_AI_PERMISSION_REPROMPT_COOLDOWN_MS = 10 * 60 * 1000L
+
+        /** SharedPreferences file dedicated to permission re-prompt state (separate so wiping it doesn't touch agent prefs). */
+        const val PERMISSION_REPROMPT_PREFS_NAME = "permission_reprompt_state"
+
+        /** Last `SystemClock.elapsedRealtime()` (ms) the activity re-fired `permissionLauncher.launch(...)`. Stored under [PERMISSION_REPROMPT_PREFS_NAME]. */
+        const val PREF_LAST_EDGE_AI_PROMPT_MS = "last_edge_ai_prompt_elapsed_ms"
+
+        /**
+         * Pure decision helper used by [requestRequiredPermissionsWithCooldown] —
+         * extracted so it can be unit-tested without bringing up an Activity /
+         * Robolectric. Returns true when the activity should re-fire the system
+         * permission dialog on the current onResume tick.
+         *
+         * @param hasAllPermissions whether every required runtime permission
+         *   is already granted; true short-circuits to "no re-prompt".
+         * @param lastPromptElapsedMs the value persisted under
+         *   [PREF_LAST_EDGE_AI_PROMPT_MS] from a previous prompt — `0L` means
+         *   "never prompted yet" and always permits a prompt.
+         * @param currentElapsedMs the caller's current
+         *   `SystemClock.elapsedRealtime()` (decoupled here so tests inject a
+         *   fixed clock).
+         * @param cooldownMs the configured cooldown — defaults to
+         *   [EDGE_AI_PERMISSION_REPROMPT_COOLDOWN_MS] in production.
+         */
+        @JvmStatic
+        fun shouldRepromptEdgeAiPermissions(
+            hasAllPermissions: Boolean,
+            lastPromptElapsedMs: Long,
+            currentElapsedMs: Long,
+            cooldownMs: Long = EDGE_AI_PERMISSION_REPROMPT_COOLDOWN_MS
+        ): Boolean {
+            if (hasAllPermissions) return false
+            if (lastPromptElapsedMs <= 0L) return true
+            return (currentElapsedMs - lastPromptElapsedMs) >= cooldownMs
+        }
+
+        /**
+         * Intent extra set by [launchSetupWizard] on the long-press re-entry
+         * path so the per-agent `SetupWizardActivity` can distinguish a
+         * post-setup recovery launch (user held the WebView to re-grant
+         * CAMERA / RECORD_AUDIO) from a first-run cold-start launch. Each
+         * wizard reads this extra in `onCreate` and skips its
+         * "PREF_SETUP_COMPLETE → bounce to MainActivity" early-return when
+         * it is true. Kept on the base class so platform code can rely on a
+         * single canonical key instead of three slightly-different
+         * per-agent constants.
+         */
+        const val EXTRA_SETUP_WIZARD_FORCE_SHOW =
+            "com.trillboards.ctv.core.SETUP_WIZARD_FORCE_SHOW"
+
+        /**
+         * Pure decision helper used by [armSetupWizardLongPressOnWebView] —
+         * returns true iff the user has held the WebView surface long enough
+         * AND the platform exposes a `SetupWizardActivity` to launch. Extracted
+         * so the timing math + the class-existence gate are unit-testable
+         * without Robolectric.
+         *
+         * @param elapsedMs how long the ACTION_DOWN has been held (callers
+         *   compute against `SystemClock.elapsedRealtime`).
+         * @param setupWizardClass the class returned by
+         *   [getSetupWizardClass]; null on platforms that have not wired the
+         *   wizard. Always short-circuits to false when null so a missing
+         *   override never crashes the host activity.
+         * @param longPressThresholdMs the configured hold duration — defaults
+         *   to the documented 5 seconds. Tests inject a smaller value.
+         */
+        @JvmStatic
+        fun shouldLaunchSetupWizardOnLongPress(
+            elapsedMs: Long,
+            setupWizardClass: Class<out android.app.Activity>?,
+            longPressThresholdMs: Long = LONG_PRESS_DURATION_MS
+        ): Boolean {
+            if (setupWizardClass == null) return false
+            if (elapsedMs <= 0L) return false
+            return elapsedMs >= longPressThresholdMs
+        }
+
+        /**
+         * Three-state UI classifier driving the wizard's new "Audience sensing"
+         * step copy:
+         *
+         *   - [AiSensingStepState.ACTIVE]        — granted; green-check & auto-advance.
+         *   - [AiSensingStepState.NEEDS_GRANT]   — denied; CTA into Settings.
+         *   - [AiSensingStepState.NOT_SUPPORTED] — platform has zero required perms.
+         *
+         * Defensive against a negative `requiredPermissionCount` (collapses
+         * to NOT_SUPPORTED rather than crashing). Wired into each platform's
+         * `SetupWizardActivity` via the protected
+         * [BaseAgentActivity.requiredPermissions] surface + the hoisted
+         * [hasAllRequiredPermissions] read.
+         */
+        @JvmStatic
+        fun classifyAiSensingStep(
+            requiredPermissionCount: Int,
+            hasAllRequiredPermissions: Boolean
+        ): AiSensingStepState {
+            if (requiredPermissionCount <= 0) return AiSensingStepState.NOT_SUPPORTED
+            return if (hasAllRequiredPermissions) {
+                AiSensingStepState.ACTIVE
+            } else {
+                AiSensingStepState.NEEDS_GRANT
+            }
+        }
+    }
+
+    /**
+     * Wizard step state for the on-device "Audience sensing" entry point
+     * shared across tablet/android-tv/fire-tv `SetupWizardActivity` flows.
+     */
+    enum class AiSensingStepState {
+        /** All required perms granted; render green check + auto-advance. */
+        ACTIVE,
+
+        /** Some required perms missing; render CTA → Settings deep-link. */
+        NEEDS_GRANT,
+
+        /** Platform reports zero required perms (e.g. lite flavor); honest "unavailable" copy. */
+        NOT_SUPPORTED
     }
 
     // ── Per-platform abstract surface ─────────────────────────────────────────
@@ -198,6 +323,19 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
      */
     protected open fun onPlatformReload(reason: String) {}
 
+    /**
+     * Per-agent override returning the `SetupWizardActivity` class to launch
+     * on a 5-second long-press of the WebView surface. Tablet returns
+     * `com.trillboards.ctv.tablet.ui.SetupWizardActivity`; android-tv returns
+     * `com.trillboards.ctv.android.ui.SetupWizardActivity`; default `null`
+     * disables the long-press path entirely.
+     *
+     * `null` returns are valid for agents that haven't wired an in-app wizard
+     * — [shouldLaunchSetupWizardOnLongPress] short-circuits before any
+     * Intent is constructed.
+     */
+    protected open fun getSetupWizardClass(): Class<out android.app.Activity>? = null
+
     // ── Internal state ────────────────────────────────────────────────────────
 
     protected lateinit var kioskLockManager: KioskLockManager
@@ -217,6 +355,14 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
     private var retryCount = 0
     private val longPressHandler = Handler(Looper.getMainLooper())
     private var longPressRunnable: Runnable? = null
+
+    // Distinct from the kiosk-PIN long-press handler so the two timers can
+    // arm independently — tablet wires kiosk long-press onto the touch
+    // interceptor view AND wizard long-press onto the WebView; android-tv
+    // only wires the wizard variant (no touch interceptor at all).
+    private val setupWizardLongPressHandler = Handler(Looper.getMainLooper())
+    private var setupWizardLongPressRunnable: Runnable? = null
+    private var setupWizardLongPressDownMs: Long = 0L
 
     // RUNNING_CRITICAL cache-clear cooldown shared across both platforms.
     private var lastCacheClearMs = 0L
@@ -301,6 +447,34 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         }
     }
 
+    /**
+     * Receives the cross-package [INTENT_EDGE_AI_PERMISSION_PROMPT] broadcast
+     * fired from [com.trillboards.ctv.core.service.BaseDeviceAgentService] when
+     * heartbeat detects edge-AI hardware present but CAMERA / RECORD_AUDIO
+     * missing. The heartbeat-driven path runs the cooldown-guarded re-prompt
+     * first; if the cooldown is still active OR if the system dialog has been
+     * permanently denied, falls through to [promptEdgeAiPermissionsViaSettings]
+     * so the user still gets a clear path to grant the permissions from the
+     * "App info" screen.
+     *
+     * Mirrors fire-tv-agent's pre-hoist pattern; android-tv / tablet pick it
+     * up automatically because [registerReceivers] (called from
+     * [initializeAfterContentView]) registers this receiver on every agent.
+     */
+    protected val edgeAiPermissionPromptReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != INTENT_EDGE_AI_PERMISSION_PROMPT) return
+            Log.i(TAG, "Received INTENT_EDGE_AI_PERMISSION_PROMPT — running re-prompt loop")
+            val attemptedDialog = requestRequiredPermissionsWithCooldown(
+                reason = "intent_edge_ai_permission_prompt"
+            )
+            if (!attemptedDialog && !hasAllRequiredPermissions()) {
+                Log.i(TAG, "Re-prompt cooldown active / dialog suppressed — falling back to Settings deep-link")
+                promptEdgeAiPermissionsViaSettings()
+            }
+        }
+    }
+
     // ── onCreate ──────────────────────────────────────────────────────────────
 
     /**
@@ -337,6 +511,16 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
 
+        // Initialize UMP consent flow before any AdMob/IMA code runs.
+        // Required by Play Store policy because MobileAds.registerWebView() in
+        // setupWebView() triggers installed-app enumeration for ad-targeting.
+        // The form renders on first launch; subsequent launches skip if
+        // consent is still valid. WebView setup proceeds regardless of the
+        // outcome — registerWebView itself is gated separately on
+        // ConsentManager.canRegisterWebView().
+        com.trillboards.ctv.core.consent.ConsentManager.init(this)
+        com.trillboards.ctv.core.consent.ConsentManager.requestConsentIfNeeded(this) { /* result logged inside ConsentManager */ }
+
         setupWebView()
         wireKioskTrigger()
         registerReceivers()
@@ -366,28 +550,131 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         }
     }
 
-    private fun hasAllRequiredPermissions(): Boolean {
+    fun hasAllRequiredPermissions(): Boolean {
         return requiredPermissions().all {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
     }
+
+    /**
+     * Public accessor exposing the platform's required-permission count to
+     * the per-agent `SetupWizardActivity` (whose own AppCompatActivity does
+     * NOT extend [BaseAgentActivity], so it can't reach the protected
+     * [requiredPermissions] surface directly). Reads through
+     * [requiredPermissions] so the lite flavor's empty-array case still
+     * collapses to 0 → [classifyAiSensingStep] returns NOT_SUPPORTED.
+     */
+    fun requiredPermissionCount(): Int = requiredPermissions().size
 
     private fun hasLocationPermission(): Boolean {
         return ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
     }
 
+    /**
+     * Initial onCreate prompt — unconditional. Subsequent re-prompts go through
+     * [requestRequiredPermissionsWithCooldown] (called from [onResume] and from
+     * the [edgeAiPermissionPromptReceiver]).
+     */
     private fun requestRequiredPermissions() {
         val perms = requiredPermissions()
         val missing = perms.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isNotEmpty()) {
-            Log.i(TAG, "Requesting permissions: ${missing.joinToString()}")
+            Log.i(TAG, "Requesting permissions (initial): ${missing.joinToString()}")
+            markEdgeAiPromptDispatched()
             permissionLauncher.launch(missing.toTypedArray())
         } else {
             Log.i(TAG, "All required permissions already granted")
             startAgentService()
+        }
+    }
+
+    /**
+     * Cooldown-guarded re-prompt loop hoisted from
+     * `fire-tv-agent/.../DeviceAgentService.kt:maybePromptEdgeAiPermissions`.
+     * Fires the system permission dialog if any required permission is still
+     * missing AND at least [EDGE_AI_PERMISSION_REPROMPT_COOLDOWN_MS] has
+     * elapsed since the last prompt. Tracks last-prompt timestamp in a
+     * dedicated SharedPreferences file ([PERMISSION_REPROMPT_PREFS_NAME]).
+     *
+     * Called from [onResume] (so a user who returned from Settings sees a
+     * fresh prompt) and from [edgeAiPermissionPromptReceiver] (so the
+     * heartbeat-driven nudge from [com.trillboards.ctv.core.service.BaseDeviceAgentService]
+     * trips the same path).
+     *
+     * @return true if the system permission dialog was launched on this call;
+     *   false if it was skipped because all perms are already granted, no
+     *   perms are required, OR the cooldown is still active. The
+     *   [edgeAiPermissionPromptReceiver] uses the false-with-missing-perms
+     *   case to fall back to the Settings deep-link.
+     */
+    protected fun requestRequiredPermissionsWithCooldown(reason: String): Boolean {
+        val perms = requiredPermissions()
+        if (perms.isEmpty()) return false
+
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        val hasAll = missing.isEmpty()
+
+        val state = getSharedPreferences(PERMISSION_REPROMPT_PREFS_NAME, Context.MODE_PRIVATE)
+        val lastPromptMs = state.getLong(PREF_LAST_EDGE_AI_PROMPT_MS, 0L)
+        val nowMs = SystemClock.elapsedRealtime()
+
+        if (!shouldRepromptEdgeAiPermissions(
+                hasAllPermissions = hasAll,
+                lastPromptElapsedMs = lastPromptMs,
+                currentElapsedMs = nowMs
+            )
+        ) {
+            if (hasAll) {
+                Log.d(TAG, "Re-prompt skipped (reason=$reason): all required perms granted")
+            } else {
+                val remainingMs = EDGE_AI_PERMISSION_REPROMPT_COOLDOWN_MS - (nowMs - lastPromptMs)
+                Log.d(TAG, "Re-prompt skipped (reason=$reason): cooldown active, ${remainingMs / 1000}s remaining")
+            }
+            return false
+        }
+
+        Log.i(TAG, "Re-prompting permissions (reason=$reason, missing=${missing.joinToString()})")
+        state.edit().putLong(PREF_LAST_EDGE_AI_PROMPT_MS, nowMs).apply()
+        return try {
+            permissionLauncher.launch(missing.toTypedArray())
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "permissionLauncher.launch failed (reason=$reason) — falling back to Settings", e)
+            promptEdgeAiPermissionsViaSettings()
+            false
+        }
+    }
+
+    /** Persist the dispatch timestamp so the cooldown helper sees the initial onCreate prompt. */
+    private fun markEdgeAiPromptDispatched() {
+        getSharedPreferences(PERMISSION_REPROMPT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(PREF_LAST_EDGE_AI_PROMPT_MS, SystemClock.elapsedRealtime())
+            .apply()
+    }
+
+    /**
+     * Deep-link the user to the app's "App info" screen so they can grant
+     * CAMERA / RECORD_AUDIO from the system Settings page even when the
+     * permission dialog was permanently denied. Mirrors the battery-optimization
+     * deep-link pattern in [promptBatteryOptimizationExemption]. Always
+     * renders a full activity (not a dialog) so it works on launchers /
+     * kiosks that suppress system dialogs.
+     */
+    fun promptEdgeAiPermissionsViaSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.parse("package:$packageName"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(intent)
+            Log.i(TAG, "Launched ACTION_APPLICATION_DETAILS_SETTINGS for permission grant")
+        } catch (e: Exception) {
+            Log.w(TAG, "Settings deep-link failed", e)
         }
     }
 
@@ -739,7 +1026,14 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         // Register WebView with Google Mobile Ads SDK (must be before loadUrl).
         WebViewAdsRegistrar.register(webView)
         // Attach native device identity bridge (must be before loadUrl).
-        nativeDeviceBridge = NativeDeviceBridge.attach(webView, this)
+        // Pass `this` as the Activity so the JS bridge's
+        // `requestEdgeAiPermissions()` can route into
+        // `promptEdgeAiPermissionsViaSettings()` — same path the wizard
+        // step + heartbeat-driven re-prompt use.
+        nativeDeviceBridge = NativeDeviceBridge.attach(webView, this, this)
+        // Wire the 5-second WebView long-press → SetupWizard re-entry. No-op
+        // on platforms whose `getSetupWizardClass()` returns null.
+        armSetupWizardLongPressOnWebView()
         loadScreenUrl()
     }
 
@@ -809,6 +1103,10 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
             }
             activeWebView = newWebView
             setupWebView()
+            // setupWebView() re-arms armSetupWizardLongPressOnWebView() on
+            // the fresh WebView reference, so no additional wiring needed
+            // here. Documented for the reader who expects parity with
+            // armLongPressOnInterceptor (re-armed in onWebViewRecreated).
             onWebViewRecreated(newWebView)
         }, 500)
     }
@@ -825,6 +1123,10 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         broadcastManager.registerReceiver(maintenanceReceiver, IntentFilter(keys.maintenanceCycle))
         broadcastManager.registerReceiver(clearCacheReceiver, IntentFilter(keys.clearCache))
         broadcastManager.registerReceiver(kioskControlReceiver, IntentFilter(keys.kioskControl))
+        broadcastManager.registerReceiver(
+            edgeAiPermissionPromptReceiver,
+            IntentFilter(INTENT_EDGE_AI_PERMISSION_PROMPT)
+        )
     }
 
     private fun unregisterReceivers() {
@@ -832,6 +1134,7 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         runCatching { broadcastManager.unregisterReceiver(maintenanceReceiver) }
         runCatching { broadcastManager.unregisterReceiver(clearCacheReceiver) }
         runCatching { broadcastManager.unregisterReceiver(kioskControlReceiver) }
+        runCatching { broadcastManager.unregisterReceiver(edgeAiPermissionPromptReceiver) }
     }
 
     private fun startKioskModeIfEnabled() {
@@ -867,6 +1170,84 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
             }
             currentWebView().dispatchTouchEvent(event)
             true
+        }
+    }
+
+    /**
+     * Hooks a 5-second hold on the live WebView surface that re-launches the
+     * per-agent `SetupWizardActivity`. Users who blew past the wizard on
+     * first run (or whose permissions got revoked from the OS Settings app)
+     * can hold the screen to re-enter and re-grant.
+     *
+     * Distinct from [armLongPressOnInterceptor] — tablet's existing kiosk
+     * long-press lives on the touch interceptor view above the WebView, while
+     * this listener attaches to the WebView itself. The interceptor wraps the
+     * WebView only on tablet; android-tv and fire-tv have no interceptor, so
+     * this method is their sole long-press path.
+     *
+     * No-op when [getSetupWizardClass] returns null — same contract as
+     * [shouldLaunchSetupWizardOnLongPress]. Safe to call on platforms that
+     * haven't wired a wizard.
+     */
+    protected fun armSetupWizardLongPressOnWebView() {
+        if (getSetupWizardClass() == null) return
+        val webView = currentWebView()
+        webView.setOnTouchListener listener@{ _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    setupWizardLongPressDownMs = SystemClock.elapsedRealtime()
+                    val runnable = Runnable {
+                        val elapsedMs = SystemClock.elapsedRealtime() - setupWizardLongPressDownMs
+                        if (shouldLaunchSetupWizardOnLongPress(
+                                elapsedMs = elapsedMs,
+                                setupWizardClass = getSetupWizardClass()
+                            )
+                        ) {
+                            launchSetupWizard()
+                        }
+                    }
+                    setupWizardLongPressRunnable = runnable
+                    setupWizardLongPressHandler.postDelayed(runnable, LONG_PRESS_DURATION_MS)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    setupWizardLongPressRunnable?.let { setupWizardLongPressHandler.removeCallbacks(it) }
+                    setupWizardLongPressRunnable = null
+                    setupWizardLongPressDownMs = 0L
+                }
+            }
+            // Returning false lets normal WebView gesture handling proceed
+            // (scroll, tap, IMA user-activation) — we only "spy" on the
+            // touch stream, never consume it. Tablet's touch interceptor
+            // already routes events to the WebView via dispatchTouchEvent;
+            // this listener fires alongside that path.
+            false
+        }
+    }
+
+    /**
+     * Start the per-agent `SetupWizardActivity` from a long-press / external
+     * trigger. No-op when [getSetupWizardClass] is null (platforms without
+     * a wizard). Uses `FLAG_ACTIVITY_NEW_TASK + CLEAR_TOP` so the wizard
+     * replaces the current task stack instead of stacking on top of the
+     * kiosk WebView — same pattern tablet's existing `launchMainActivity`
+     * uses in reverse.
+     */
+    fun launchSetupWizard() {
+        val clazz = getSetupWizardClass() ?: return
+        try {
+            val intent = Intent(this, clazz).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                // Force-show signal: this launch path is the post-setup
+                // re-entry trigger, so the wizard's onCreate must NOT
+                // early-return on PREF_SETUP_COMPLETE=true. Each per-agent
+                // wizard reads this extra and bypasses its bounce-to-Main
+                // gate when true.
+                putExtra(EXTRA_SETUP_WIZARD_FORCE_SHOW, true)
+            }
+            startActivity(intent)
+            Log.i(TAG, "Launched setup wizard via long-press: ${clazz.name}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to launch setup wizard", e)
         }
     }
 
@@ -936,6 +1317,7 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
         }
         options.add("Change PIN")
         options.add("Refresh Screen")
+        options.add("Privacy Settings")
         options.add("Exit App")
         options.add("Cancel")
 
@@ -961,6 +1343,13 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
                     "Refresh Screen" -> {
                         reloadWebView("settings_refresh")
                         Toast.makeText(this, "Refreshing...", Toast.LENGTH_SHORT).show()
+                    }
+                    "Privacy Settings" -> {
+                        com.trillboards.ctv.core.consent.ConsentManager.showPrivacyOptionsForm(this) {
+                            // Form dismissed — no further action; consent state is
+                            // applied immediately and registerWebView re-checks on
+                            // next WebView setup. A reload picks up any change.
+                        }
                     }
                     "Exit App" -> {
                         if (isKioskEnabled) {
@@ -1012,6 +1401,13 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
             configureFullscreen()
         }
 
+        // Recoverable edge-AI permission re-prompt — fires the system dialog
+        // again (subject to 10-min cooldown) any time the user comes back to
+        // the foreground without having granted CAMERA / RECORD_AUDIO.
+        // Hoisted from fire-tv-agent's DeviceAgentService heartbeat path so
+        // tablet + android-tv inherit the same recovery loop.
+        requestRequiredPermissionsWithCooldown("on_resume")
+
         pendingSensorRebindOnResume = wasStoppedSinceLastResume
         wasStoppedSinceLastResume = false
 
@@ -1055,6 +1451,7 @@ abstract class BaseAgentActivity : ComponentActivity(), AgentRecreatableActivity
     override fun onDestroy() {
         unregisterTransportTypeCallback()
         longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
+        setupWizardLongPressRunnable?.let { setupWizardLongPressHandler.removeCallbacks(it) }
         cancelRetry()
         cancelPageLoadTimeout()
         unregisterReceivers()

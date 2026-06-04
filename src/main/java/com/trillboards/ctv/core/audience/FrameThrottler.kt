@@ -15,8 +15,14 @@ import com.trillboards.ctv.core.SensingConfig
  */
 class FrameThrottler(
     initialTargetFps: Int = SensingConfig.get().capture.initialTargetFps,
-    private val cameraFps: Int = SensingConfig.get().capture.cameraFps
+    cameraFps: Int = SensingConfig.get().capture.cameraFps
 ) {
+    // Effective camera production rate. Starts from config (historically assumed
+    // 30) but is corrected to the real rate once the AE target-FPS range is pinned
+    // at bind time — see setCameraFps(). calculateSkipRate() decimates from this
+    // down to targetFps, so a stale value makes the throttler over-skip.
+    @Volatile
+    private var cameraFps: Int = cameraFps.coerceAtLeast(1)
     companion object {
         private const val TAG = "FrameThrottler"
         val MIN_FPS get() = SensingConfig.get().capture.minFps
@@ -70,6 +76,27 @@ class FrameThrottler(
             frameCounter = 0  // Reset counter to avoid burst
 
             Log.i(TAG, "Target FPS changed: $oldFps -> $targetFps (skipRate: $skipRate)")
+        }
+    }
+
+    /**
+     * Correct the assumed camera production rate (frames/sec the HAL actually
+     * delivers) and recompute the skip rate.
+     *
+     * Call this once the camera is bound with the effective AE target-FPS cap. If
+     * left stale (e.g. assuming 30 while the AE range pins the HAL to 15) the
+     * throttler over-skips — skipRate = cameraFps / targetFps would decimate from a
+     * rate the camera never produces, so the analyzer runs below its target.
+     *
+     * @param newCameraFps Effective frames/sec the camera delivers (≥1).
+     */
+    fun setCameraFps(newCameraFps: Int) {
+        val clamped = newCameraFps.coerceAtLeast(1)
+        if (clamped != cameraFps) {
+            val old = cameraFps
+            cameraFps = clamped
+            skipRate = calculateSkipRate(targetFps)
+            Log.i(TAG, "Camera FPS corrected: $old -> $cameraFps (skipRate: $skipRate)")
         }
     }
 

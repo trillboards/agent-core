@@ -1,14 +1,19 @@
 package com.trillboards.ctv.core.bridge
 
+import android.app.Activity
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import com.trillboards.ctv.core.activity.BaseAgentActivity
 import com.trillboards.ctv.core.identity.AdvertisingIdCollector
 import com.trillboards.ctv.core.identity.AdvertisingIdResult
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -22,8 +27,18 @@ import org.json.JSONObject
  * Thread safety: @JavascriptInterface methods run on a WebView background
  * thread. All fields are read from immutable Build.* constants or the
  * cached AdvertisingIdCollector (volatile + TTL).
+ *
+ * @param context Application context — used for everything not requiring
+ *   an Activity (DisplayManager, AdvertisingIdCollector, etc.).
+ * @param activityRef Weak ref to the host Activity, optional, used solely
+ *   by [requestEdgeAiPermissions] to route into
+ *   [BaseAgentActivity.promptEdgeAiPermissionsViaSettings]. Held weakly so
+ *   the bridge does not leak the host across WebView recreation.
  */
-class NativeDeviceBridge(private val context: Context) {
+class NativeDeviceBridge(
+    private val context: Context,
+    private val activityRef: WeakReference<Activity>? = null
+) {
 
     @Volatile
     private var cachedAdId: AdvertisingIdResult? = null
@@ -47,11 +62,23 @@ class NativeDeviceBridge(private val context: Context) {
 
         /**
          * Attach this bridge to a WebView. Must be called BEFORE loadUrl().
+         *
+         * Optional `activity` parameter wires the
+         * `window.TrillboardsNativeDevice.requestEdgeAiPermissions()` JS path
+         * into [BaseAgentActivity.promptEdgeAiPermissionsViaSettings]; pass
+         * the host Activity when the WebView is rendered inside a
+         * [BaseAgentActivity] subclass. Older callers that pass only the
+         * Context retain the original behavior — the JS bridge's permission
+         * RPC silently no-ops (and logs once) instead of crashing.
          */
-        fun attach(webView: WebView, context: Context): NativeDeviceBridge {
-            val bridge = NativeDeviceBridge(context.applicationContext)
+        @JvmOverloads
+        fun attach(webView: WebView, context: Context, activity: Activity? = null): NativeDeviceBridge {
+            val bridge = NativeDeviceBridge(
+                context.applicationContext,
+                activity?.let { WeakReference(it) }
+            )
             webView.addJavascriptInterface(bridge, JS_INTERFACE_NAME)
-            Log.i(TAG, "Native device bridge attached to WebView")
+            Log.i(TAG, "Native device bridge attached to WebView (activity=${activity?.javaClass?.simpleName ?: "none"})")
             return bridge
         }
     }
@@ -164,6 +191,44 @@ class NativeDeviceBridge(private val context: Context) {
         } else {
             Log.w(TAG, "[OverlayHealth] Failed to parse payload")
         }
+    }
+
+    /**
+     * Called from JavaScript: window.TrillboardsNativeDevice.requestEdgeAiPermissions()
+     *
+     * Opt-in path for the React PWA inside the kiosk WebView to surface the
+     * system Settings → App info page so the user can grant
+     * CAMERA / RECORD_AUDIO. Mirrors the on-device wizard CTA (which fires
+     * the same [BaseAgentActivity.promptEdgeAiPermissionsViaSettings]
+     * helper) — the JS-driven path is intended as a secondary trigger; the
+     * primary remains the in-app SetupWizardActivity.
+     *
+     * No-op (with a Log.w) when the bridge wasn't attached with an Activity
+     * reference, or when the weak ref has already been GC'd. Returning a
+     * boolean lets the JS side branch on "intent dispatched" vs "fallback to
+     * notice copy".
+     */
+    @JavascriptInterface
+    fun requestEdgeAiPermissions(): Boolean {
+        val activity = activityRef?.get()
+        if (activity !is BaseAgentActivity) {
+            Log.w(
+                TAG,
+                "requestEdgeAiPermissions() invoked but no BaseAgentActivity available " +
+                    "(activity=${activity?.javaClass?.simpleName ?: "null"}); silently no-op"
+            )
+            return false
+        }
+        // Settings deep-link must dispatch on the main thread — JS bridge
+        // callbacks run on a WebView background thread.
+        Handler(Looper.getMainLooper()).post {
+            try {
+                activity.promptEdgeAiPermissionsViaSettings()
+            } catch (e: Exception) {
+                Log.w(TAG, "promptEdgeAiPermissionsViaSettings() threw from JS bridge", e)
+            }
+        }
+        return true
     }
 
     /**

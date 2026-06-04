@@ -24,7 +24,7 @@ import kotlinx.serialization.Contextual
 /**
  * 
  *
- * @param apiKey Store this securely - only shown once!
+ * @param apiKey Store this securely - only shown once. The default self-serve key authenticates the Partner API surface in this spec. Managed CTV Measurement programs may receive a scoped CTV Measurement key when Trillboards asks them to use the advanced `ctv_publisher` flow. 
  * @param partnerId 
  * @param portalAccess 
  * @param revenueSharePercent 
@@ -35,7 +35,7 @@ import kotlinx.serialization.Contextual
 
 data class RegisterPartner201ResponseData (
 
-    /* Store this securely - only shown once! */
+    /* Store this securely - only shown once. The default self-serve key authenticates the Partner API surface in this spec. Managed CTV Measurement programs may receive a scoped CTV Measurement key when Trillboards asks them to use the advanced `ctv_publisher` flow.  */
     @SerialName(value = "api_key")
     val apiKey: kotlin.String? = null,
 

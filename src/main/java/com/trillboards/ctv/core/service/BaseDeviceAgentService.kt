@@ -17,11 +17,13 @@ import androidx.lifecycle.LifecycleService
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.trillboards.ctv.core.AgentConfig as CoreAgentConfig
 import com.trillboards.ctv.core.DeviceIdentity
+import com.trillboards.ctv.core.INTENT_EDGE_AI_PERMISSION_PROMPT
 import com.trillboards.ctv.core.audience.AudienceSensingService
-import com.trillboards.ctv.core.audience.InsightExtractor
 import com.trillboards.ctv.core.audience.SensingConfig
+import com.trillboards.ctv.core.audience.SpeechInsights
 import com.trillboards.ctv.core.audience.SensingProfileManager
 import com.trillboards.ctv.core.device.AgentPowerAdapter
+import com.trillboards.ctv.core.diagnostics.BootDiagnosticRecorder
 import com.trillboards.ctv.core.device.KioskLockManager
 import com.trillboards.ctv.core.models.HeartbeatPayload
 import com.trillboards.ctv.core.net.ApiClient
@@ -203,7 +205,17 @@ abstract class BaseDeviceAgentService : LifecycleService() {
             "isDeviceOwner" to isDeviceOwner,
             "sensingMode" to audienceSensing.getSensingMode(),
             "sensingUptime" to audienceSensing.getSensingUptime(),
-            "trackedFaceCount" to audienceSensing.getTrackedFaceCount()
+            "trackedFaceCount" to audienceSensing.getTrackedFaceCount(),
+            // peppy-cooking-blum PR 5 — bootloop diagnostic snapshot. Always
+            // emit (even on a successful boot) so the server sees the
+            // bootAttemptCount=0 + lastBootStage=null healthy signature and
+            // can distinguish it from the pre-instrumentation "agent never
+            // emitted bootDiagnostic" case (where ALL the columns stay
+            // NULL). ApiClient.payloadToJson passes Map<String,Any?> values
+            // straight to JSONObject.put — a JSONObject value here serializes
+            // as a nested JSON object, which is what server-side
+            // metadataFromBody.bootDiagnostic expects.
+            "bootDiagnostic" to bootDiagnostic.snapshotForHeartbeat()
         )
         metadata.putAll(extraHeartbeatMetadata())
 
@@ -289,6 +301,22 @@ abstract class BaseDeviceAgentService : LifecycleService() {
     protected val kioskLockManager by lazy { KioskLockManager(this, adminComponent) }
     protected val localBroadcastManager: LocalBroadcastManager by lazy { LocalBroadcastManager.getInstance(this) }
 
+    /**
+     * peppy-cooking-blum PR 5 — bootloop diagnostic recorder.
+     *
+     * Uses a SEPARATE SharedPreferences file (`boot_diagnostic`) from the
+     * agent's main prefs (`coreConfig().sharedPrefsName`) so that:
+     *   (a) clearing agent prefs (e.g. factory reset, OAuth reauth flow)
+     *       does NOT silently wipe the bootloop history operators are
+     *       investigating;
+     *   (b) the recorder works identically across tablet / android-tv /
+     *       fire-tv subclasses without each having to register a per-prefs-
+     *       namespace key set.
+     */
+    protected val bootDiagnostic: BootDiagnosticRecorder by lazy {
+        BootDiagnosticRecorder.fromContext(this)
+    }
+
     @Volatile
     protected var screenId: String? = null
 
@@ -331,12 +359,28 @@ abstract class BaseDeviceAgentService : LifecycleService() {
     // ── Lifecycle ─────────────────────────────────────────────────────────────
     override fun onCreate() {
         super.onCreate()
+        // peppy-cooking-blum PR 5 — bootloop diagnostic. Increment the monotonic
+        // attempt counter at the VERY start so even an OOM-kill or external
+        // force-restart (Focus Media's 12-device 05:01/17:02 UTC cron pattern)
+        // climbs the counter — the detector recognises rapid counter climb +
+        // short uptime as bootloop without needing per-stage failures. Each
+        // bootStage(…) wrap below persists a failed-stage marker if its block
+        // throws; the final markBootCompleted() at the end of onCreate clears
+        // the marker AND resets the counter to 0 on a clean boot.
+        val attemptNumber = bootDiagnostic.startBootAttempt()
+        Log.i(TAG, "Boot attempt #$attemptNumber")
         screenId = prefs.getString(prefsKeys().screenId, null)
-        startForegroundNotification()
+        bootDiagnostic.wrapStage(BootDiagnosticRecorder.STAGE_NOTIFICATION_FOREGROUND_START) {
+            startForegroundNotification()
+        }
         // Adam's Fix #1 — re-launch MainActivity if killed before service
         ensureMainActivityRunning("service_on_create")
-        connectSocket()
-        telemetryScheduler.start()
+        bootDiagnostic.wrapStage(BootDiagnosticRecorder.STAGE_SOCKET_CONNECT) {
+            connectSocket()
+        }
+        bootDiagnostic.wrapStage(BootDiagnosticRecorder.STAGE_TELEMETRY_SCHEDULER_START) {
+            telemetryScheduler.start()
+        }
         serviceScope.launch { resolveScreenId() }
 
         val sensorRebindFilter = IntentFilter().apply {
@@ -350,9 +394,14 @@ abstract class BaseDeviceAgentService : LifecycleService() {
             localBroadcastManager.registerReceiver(debugSpeechReceiver, debugFilter)
         }
 
-        startAudienceSensing()
+        bootDiagnostic.wrapStage(BootDiagnosticRecorder.STAGE_AUDIENCE_SENSING_START) {
+            startAudienceSensing()
+        }
         startMaintenanceCycle()
         onAfterBaseStarted()
+        // Cleared the slate — server sees bootAttemptCount=0 + lastBootStage
+        // NULL on the next heartbeat (~30s) which is the "healthy" signature.
+        bootDiagnostic.markBootCompleted()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -441,6 +490,7 @@ abstract class BaseDeviceAgentService : LifecycleService() {
         audienceSensing.setActiveProfileId(profile.profileId)
         audienceSensing.setActiveProgramSpec(profile.programSpecJson, profile.programSpecVersion)
         audienceSensing.setVlmPrompt(profile.vlmPrompt)
+        audienceSensing.setActiveSignalsJson(profile.signalsJson)
         audienceSensing.applyProfileToInference(profile.models)
     }
 
@@ -490,8 +540,6 @@ abstract class BaseDeviceAgentService : LifecycleService() {
 
     // ── Audience sensing ─────────────────────────────────────────────────────
     private fun startAudienceSensing() {
-        val restoredProfile = sensingProfileManager.loadPersistedProfile()
-
         screenId?.let { audienceSensing.setScreenId(it) }
 
         commandProcessor.onBrandListUpdate = { brands ->
@@ -503,15 +551,63 @@ abstract class BaseDeviceAgentService : LifecycleService() {
             audienceSensing.setActiveProfileId(profile.profileId)
             audienceSensing.setActiveProgramSpec(profile.programSpecJson, profile.programSpecVersion)
             audienceSensing.setVlmPrompt(profile.vlmPrompt)
+            audienceSensing.setActiveSignalsJson(profile.signalsJson)
             audienceSensing.applyProfileToInference(profile.models)
         }
 
-        restoredProfile?.let { persisted ->
-            Log.i(TAG, "Restoring persisted sensing profile: ${persisted.profileName}")
-            audienceSensing.setActiveProfileId(persisted.profileId)
-            audienceSensing.setActiveProgramSpec(persisted.programSpecJson, persisted.programSpecVersion)
-            audienceSensing.setVlmPrompt(persisted.vlmPrompt)
-            audienceSensing.applyProfileToInference(persisted.models)
+        // PR π (2026-06-01) — Server-first bootstrap, persisted is the fallback.
+        //
+        // Pre-fix: loadPersistedProfile() was the source of truth on cold boot, so
+        // an operator deploy that landed in the gap between heartbeat reconnect and
+        // the persistent-command queue flush left the device stuck on the previous
+        // profile (logcat: `Loaded persisted profile: soak_coffee_shop_v1`
+        // repeatedly even though the operator had pushed a different intent).
+        //
+        // Post-fix order: hit /v2/earner/sensing/profiles/:screenId first; only
+        // fall through to the SharedPreferences-backed [loadPersistedProfile]
+        // when the network/server can't serve us (offline / 5xx / 404). The same
+        // WS push subsystem keeps working for run-time updates — applyProfile()'s
+        // duplicate-suppression gate means the WS push that arrives moments later
+        // is a no-op when it matches the server-fetched bootstrap.
+        val capabilities = buildSensingProfileCapabilities()
+        val resolvedScreenId = screenId
+        if (resolvedScreenId != null && capabilities != null) {
+            serviceScope.launch {
+                val applyResult = sensingProfileManager.fetchAndApplyServerProfile(
+                    screenId = resolvedScreenId,
+                    capabilities = capabilities,
+                    fetcher = { sid -> apiClient.fetchActiveSensingProfile(sid) }
+                )
+                if (applyResult == null) {
+                    // Network/server unavailable — fall back to the persisted profile
+                    // so a previously-running deployment survives offline cold boot.
+                    val persisted = sensingProfileManager.loadPersistedProfile()
+                    if (persisted != null) {
+                        Log.i(TAG, "Server profile unavailable — falling back to persisted ${persisted.profileName}")
+                        audienceSensing.setActiveProfileId(persisted.profileId)
+                        audienceSensing.setActiveProgramSpec(persisted.programSpecJson, persisted.programSpecVersion)
+                        audienceSensing.setVlmPrompt(persisted.vlmPrompt)
+                        audienceSensing.setActiveSignalsJson(persisted.signalsJson)
+                        audienceSensing.applyProfileToInference(persisted.models)
+                    }
+                }
+                // When applyResult != null, fetchAndApplyServerProfile already
+                // invoked applyProfile → listeners ran → audienceSensing is wired.
+            }
+        } else {
+            // Pre-pairing or pre-permissions: no screenId / no capability data yet.
+            // Best-effort restore from persisted so a previously-running deployment
+            // survives a transient screenId-resolution failure (heartbeat will
+            // re-bind the screenId on the next tick).
+            val persisted = sensingProfileManager.loadPersistedProfile()
+            if (persisted != null) {
+                Log.i(TAG, "Restoring persisted sensing profile (pre-bind): ${persisted.profileName}")
+                audienceSensing.setActiveProfileId(persisted.profileId)
+                audienceSensing.setActiveProgramSpec(persisted.programSpecJson, persisted.programSpecVersion)
+                audienceSensing.setVlmPrompt(persisted.vlmPrompt)
+                audienceSensing.setActiveSignalsJson(persisted.signalsJson)
+                audienceSensing.applyProfileToInference(persisted.models)
+            }
         }
 
         provideContentStateProvider()?.let { provider ->
@@ -522,7 +618,19 @@ abstract class BaseDeviceAgentService : LifecycleService() {
         val hasAudioPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
         if (!hasCameraPermission && !hasAudioPermission) {
-            Log.w(TAG, "No camera or audio permissions - audience sensing disabled")
+            Log.w(TAG, "No camera or audio permissions - audience sensing disabled; broadcasting INTENT_EDGE_AI_PERMISSION_PROMPT")
+            // Heartbeat-driven nudge: tell MainActivity to re-fire the system
+            // permission prompt on its next foreground tick. The activity's
+            // edgeAiPermissionPromptReceiver picks this up and routes through
+            // BaseAgentActivity.requestRequiredPermissionsWithCooldown so the
+            // 10-min cooldown still applies. Hoisted from fire-tv-agent's
+            // maybePromptEdgeAiPermissions so tablet + android-tv get the
+            // same recovery loop.
+            localBroadcastManager.sendBroadcast(
+                Intent(INTENT_EDGE_AI_PERMISSION_PROMPT)
+                    .putExtra("needsCamera", true)
+                    .putExtra("needsMicrophone", true)
+            )
             return
         }
 
@@ -539,6 +647,58 @@ abstract class BaseDeviceAgentService : LifecycleService() {
         ))
 
         Log.i(TAG, "Audience sensing initialized (camera=$hasCameraPermission, audio=$hasAudioPermission)")
+    }
+
+    /**
+     * PR π (2026-06-01) — Build a [SensingProfileManager.DeviceCapabilities] from
+     * the running process's PackageManager + CameraManager probes. Mirrors the
+     * per-platform CommandProcessor.applySensingProfile helper but is generic
+     * enough to live on the base service (both tablet and android-tv expose
+     * `FEATURE_MICROPHONE` and a CAMERA_SERVICE binder).
+     *
+     * Returns null when the package manager / camera service can't be probed
+     * — caller treats null as "skip the server-fetch bootstrap and fall back to
+     * persisted-profile recovery" because we can't compute the
+     * validate-against-capabilities filter without these.
+     */
+    protected open fun buildSensingProfileCapabilities(): SensingProfileManager.DeviceCapabilities? {
+        return try {
+            val hasCameraHardware = try {
+                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as? android.hardware.camera2.CameraManager
+                cameraManager?.cameraIdList?.isNotEmpty() == true
+            } catch (e: Exception) { false }
+            val hasMicrophoneHardware = packageManager
+                .hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
+            SensingProfileManager.DeviceCapabilities(
+                hasCameraHardware = hasCameraHardware,
+                hasMicrophoneHardware = hasMicrophoneHardware
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "buildSensingProfileCapabilities failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Stop and fully restart audience sensing from scratch.
+     *
+     * This is the canonical "stop and restart sensing wiring" entry point used by
+     * recovery paths. It mirrors the 24h maintenance-cycle restart (line ~613) and
+     * is the only path that correctly re-invokes [startAudienceSensing], which
+     * re-wires the sensingProfileManager listener and calls [audienceSensing.start].
+     *
+     * Do NOT use a camera-rebind broadcast for recovery restarts — [rebindCamera]
+     * returns early when [isRunning] is false (which [stop] sets), so the service
+     * stays permanently wedged. Call this method instead.
+     */
+    protected fun restartAudienceSensing(reason: String) {
+        Log.i(TAG, "[Recovery] restartAudienceSensing($reason): stopping sensing...")
+        audienceSensing.stop()
+        serviceScope.launch {
+            delay(2_000)
+            Log.i(TAG, "[Recovery] restartAudienceSensing($reason): restarting sensing...")
+            startAudienceSensing()
+        }
     }
 
     private fun startMaintenanceCycle() {
@@ -848,11 +1008,13 @@ abstract class BaseDeviceAgentService : LifecycleService() {
             Log.w(TAG, "[DebugSpeech] Ignoring empty transcript injection")
             return false
         }
-        val insights = InsightExtractor.extract(normalized)
+        // Cloud Gemini is now the canonical extractor; debug injection emits an empty
+        // SpeechInsights so the pipeline receives the event without stale regex data.
+        val insights = SpeechInsights()
         Log.i(
             TAG,
             "[DebugSpeech] Injecting transcript (${normalized.length} chars) -> " +
-                "intent=${insights.purchaseIntent.name}, stage=${insights.purchaseJourney.stage}"
+                "cloud Gemini path (debug stub emits empty insights)"
         )
         audienceSensing.injectDebugSpeechInsights(insights)
         return true

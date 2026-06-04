@@ -22,7 +22,6 @@ data class SpeechInsights(
     // Purchase signals
     val priceInquiry: Boolean = false,
     val availabilityInquiry: Boolean = false,
-    val purchaseIntent: PurchaseIntent = PurchaseIntent.NONE,
     val purchaseJourney: PurchaseJourney = PurchaseJourney(),
     val mentionedBuyingToday: Boolean = false,
 
@@ -47,14 +46,18 @@ data class SpeechInsights(
     val speechSemantics: SpeechSemantics? = null
 ) {
     /**
-     * Check if this contains any actionable purchase signals
+     * Check if this contains any actionable purchase signals.
+     *
+     * Edge no longer infers purchase intent — that's cloud-Gemini territory
+     * (`speech_purchase_intent` enum on the audience-metrics row). Edge still
+     * surfaces price/availability/journey/buy-today signals from keyword
+     * detection; the intent enum itself is read from the cloud response.
      */
     fun hasActionablePurchaseSignals(): Boolean {
         return priceInquiry ||
                availabilityInquiry ||
                mentionedBuyingToday ||
-               purchaseJourney.stage != PurchaseJourney.NONE_STAGE ||
-               purchaseIntent in listOf(PurchaseIntent.COMPARING, PurchaseIntent.READY_TO_BUY)
+               purchaseJourney.stage != PurchaseJourney.NONE_STAGE
     }
 
     /**
@@ -136,24 +139,12 @@ data class ObjectionInsight(
     val confidence: Float = 0.5f
 )
 
-/**
- * Purchase intent levels from conversation analysis
- */
-enum class PurchaseIntent {
-    NONE,           // No purchase-related conversation
-    BROWSING,       // Just looking around
-    CONSIDERING,    // Actively thinking about purchase
-    COMPARING,      // Comparing options/brands
-    READY_TO_BUY    // Strong buy signals detected
-}
-
-fun PurchaseIntent.toSpeechSemanticRole(): String? = when (this) {
-    PurchaseIntent.READY_TO_BUY -> "selected"
-    PurchaseIntent.COMPARING -> "comparing"
-    PurchaseIntent.CONSIDERING -> "considering"
-    PurchaseIntent.BROWSING -> "browsing"
-    PurchaseIntent.NONE -> null
-}
+// PurchaseIntent enum + toSpeechSemanticRole extension removed —
+// edge no longer infers intent (regex/keyword heuristics deleted in
+// cosmic-brewing-bear task #26). The cloud Gemini response carries the
+// canonical 7-state speech_purchase_intent enum (BROWSING / RESEARCHING /
+// COMPARING / READY_TO_BUY / POST_PURCHASE / COMPLAINING / NONE) per
+// audienceVisionService.js#_assembleProfilePrompt.
 
 /**
  * Sentiment detected from conversation tone

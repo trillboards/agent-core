@@ -38,18 +38,23 @@ class FootTrafficEstimator {
      *
      * @param shadowEvents Number of light sensor shadow events (people passing between screen and light)
      * @param maxFaceCount Maximum faces detected in any single frame during the window
-     * @param estimatedOccupancy Audio-derived occupancy string ("0-5", "5-20", "20-50", "50+")
+     * @param estimatedOccupancy Audio-derived occupancy string ("0-5", "5-20", "20-50", "50+").
+     *                            cosmic-brewing-bear C1 deleted this signal source from
+     *                            AudioMetrics; null is the new normal and falls back to
+     *                            the previous "0-5" baseline weighting (3 people).
      * @param luxVariance Variance in ambient light readings (higher = more movement)
      * @return FootTrafficMetrics with estimated count and confidence
      */
     fun estimate(
         shadowEvents: Int,
         maxFaceCount: Int,
-        estimatedOccupancy: String,
+        estimatedOccupancy: String?,
         luxVariance: Float = 0f
     ): FootTrafficMetrics {
 
-        val audioOccupancy = OCCUPANCY_MAP[estimatedOccupancy] ?: 3
+        // Null occupancy → fall back to "0-5" (3) so historical estimator
+        // behavior is preserved when the audio bucket signal is absent.
+        val audioOccupancy = estimatedOccupancy?.let { OCCUPANCY_MAP[it] } ?: 3
         val ftCfg = SensingConfig.get().footTraffic
 
         // Normalize each signal to 0-1 range before fusion

@@ -15,8 +15,8 @@
 
 package com.trillboards.api.types
 
+import com.trillboards.api.types.GetPartnerScreenIntelligence200ResponseDataSummary
 import com.trillboards.api.types.GetVenueIntelligence200ResponseDedup
-import com.trillboards.api.types.GetVenueIntelligence200ResponseSummary
 import com.trillboards.api.types.GetVenueIntelligence200ResponseTimeseriesInner
 
 import kotlinx.serialization.Serializable
@@ -48,7 +48,7 @@ data class GetVenueIntelligence200Response (
     val interval: kotlin.String? = null,
 
     @SerialName(value = "summary")
-    val summary: GetVenueIntelligence200ResponseSummary? = null,
+    val summary: GetPartnerScreenIntelligence200ResponseDataSummary? = null,
 
     @SerialName(value = "timeseries")
     val timeseries: kotlin.collections.List<GetVenueIntelligence200ResponseTimeseriesInner>? = null,

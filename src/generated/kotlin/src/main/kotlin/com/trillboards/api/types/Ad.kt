@@ -15,6 +15,7 @@
 
 package com.trillboards.api.types
 
+import com.trillboards.api.types.AdTracking
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
@@ -23,12 +24,14 @@ import kotlinx.serialization.Contextual
 /**
  * 
  *
- * @param allocationId 
+ * @param allocationId Placement/allocation ID used for delivery accounting, make-goods, and pacing.
  * @param duration Duration in seconds
  * @param id Advertisement ID
+ * @param impressionId Server-generated impression ID that must be echoed when reporting proof-of-play.
  * @param impressionUrl Call this to record impression
  * @param pixelUrl 1x1 tracking pixel URL
  * @param title 
+ * @param tracking 
  * @param type 
  * @param url Media URL (CDN)
  */
@@ -36,6 +39,7 @@ import kotlinx.serialization.Contextual
 
 data class Ad (
 
+    /* Placement/allocation ID used for delivery accounting, make-goods, and pacing. */
     @SerialName(value = "allocation_id")
     val allocationId: kotlin.String? = null,
 
@@ -47,6 +51,10 @@ data class Ad (
     @SerialName(value = "id")
     val id: kotlin.String? = null,
 
+    /* Server-generated impression ID that must be echoed when reporting proof-of-play. */
+    @SerialName(value = "impression_id")
+    val impressionId: kotlin.String? = null,
+
     /* Call this to record impression */
     @Contextual @SerialName(value = "impression_url")
     val impressionUrl: java.net.URI? = null,
@@ -57,6 +65,9 @@ data class Ad (
 
     @SerialName(value = "title")
     val title: kotlin.String? = null,
+
+    @SerialName(value = "tracking")
+    val tracking: AdTracking? = null,
 
     @SerialName(value = "type")
     val type: Ad.Type? = null,

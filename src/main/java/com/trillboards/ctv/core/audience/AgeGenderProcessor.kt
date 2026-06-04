@@ -108,6 +108,18 @@ class AgeGenderProcessor(private val context: Context) {
     private var totalFacesProcessed = 0
     private var totalConfidence = 0f
 
+    // Phase 1c collapse-point #4 fix — per-face age/gender overlay.
+    // The legacy `accumulate()` API immediately collapsed each result into
+    // histogram bin counters, throwing away which face it came from. We
+    // keep that path (so existing readers continue to see age_distribution
+    // / gender_split JSON) AND maintain a parallel per-face map keyed by
+    // ML Kit face track ID. AudienceAnalyzer reads this map and threads
+    // age/gender into the PerFaceAttention bucket for the matching faceId
+    // at drain time. ConcurrentHashMap: producer (analyzer thread) and
+    // consumer (window-flush thread) overlap.
+    private val perFaceLatest =
+        java.util.concurrent.ConcurrentHashMap<Int, AgeGenderResult>()
+
     // Pre-allocated inference buffers (reused per face to prevent GC pressure)
     private var inputBuffer: ByteBuffer? = null
     private var pixelBuffer: IntArray? = null
@@ -144,8 +156,8 @@ class AgeGenderProcessor(private val context: Context) {
             return true
         }
 
-        Log.d(TAG, "Age/gender model not found (asset+OTA both missing) — " +
-            "heartbeat will skip onDeviceDemographics until OTA download completes.")
+        Log.w(TAG, "[AgeGender] Model NOT loaded: asset+OTA both missing — " +
+            "on_device_demographics will remain null until OTA download completes.")
         return false
     }
 
@@ -179,13 +191,56 @@ class AgeGenderProcessor(private val context: Context) {
 
         return try {
             val model = loadModelFile()
-            // FaceXFormer benefits from 4 threads on big-core mobile CPUs
-            // (Tab S11 MediaTek 9300+ has 4 big cores; latency drops from
-            // ~315ms @ 1 thread to ~100ms @ 4 threads in CPU benchmarks).
-            val options = Interpreter.Options().apply {
-                setNumThreads(4)
+            // FaceXFormer 178MB Swin-B transformer: prefer NNAPI delegate so
+            // we actually use the MediaTek APU on Dimensity 9000+ (e.g. Tab
+            // S11's Dimensity 9400 reports MT6991 → APU per HardwareManifest)
+            // or the Hexagon DSP on Snapdragon 8-series, where CPU-only
+            // inference sat at ~100ms/face — the single biggest item in the
+            // per-frame budget (live ADB telemetry on the S11 showed
+            // avgInferenceMs=103 with this path on pure CPU). NNAPI does
+            // per-op partitioning and falls back to CPU for unsupported ops
+            // automatically. Codex P2 review on PR #6229: a try around the
+            // Interpreter ctor is not enough — some NNAPI drivers initialize
+            // successfully but fail at the FIRST runForMultipleInputsOutputs()
+            // call for this specific model/driver combo, after which every
+            // classifyWithPreallocatedCrop() silently returns null while
+            // isInitialized stays true (demographics regress to permanent
+            // null on those devices). So we run a synthetic test inference
+            // BEFORE publishing the interpreter; on either construction OR
+            // invoke failure we close the bad candidate and rebuild plain
+            // 4-thread CPU so devices without functional NNAPI keep working.
+            val interp = try {
+                val candidate = Interpreter(model, Interpreter.Options().apply {
+                    setUseNNAPI(true)
+                    setNumThreads(4) // CPU fallback within NNAPI partitioning
+                })
+                try {
+                    // Synthetic invoke: zero-filled 1×3×224×224 float32 input +
+                    // output tensors matching the expected [1,8] age and
+                    // [1,2] gender shapes. Zeros are fine — we only care that
+                    // the delegate completes the invoke without throwing.
+                    val testInput = ByteBuffer
+                        .allocateDirect(1 * 3 * INPUT_SIZE * INPUT_SIZE * 4)
+                        .order(ByteOrder.nativeOrder())
+                    val testAgeOut = Array(1) { FloatArray(NUM_AGE_BINS) }
+                    val testGenderOut = Array(1) { FloatArray(NUM_GENDER_CLASSES) }
+                    candidate.runForMultipleInputsOutputs(
+                        arrayOf(testInput),
+                        mapOf(0 to testAgeOut, 1 to testGenderOut)
+                    )
+                    Log.i(TAG, "AgeGender NNAPI delegate validated via test inference")
+                    candidate
+                } catch (invokeErr: Exception) {
+                    Log.w(TAG, "AgeGender NNAPI invoke failed (${invokeErr.message}); " +
+                        "falling back to 4-thread CPU")
+                    candidate.close()
+                    Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "AgeGender NNAPI interpreter construction failed: ${e.message}; " +
+                    "falling back to 4-thread CPU")
+                Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
             }
-            val interp = Interpreter(model, options)
 
             // Validate I/O contract before publishing the interpreter
             val inDetails = interp.getInputTensor(0)
@@ -229,10 +284,16 @@ class AgeGenderProcessor(private val context: Context) {
             ageOutput = Array(1) { FloatArray(NUM_AGE_BINS) }
             genderOutput = Array(1) { FloatArray(NUM_GENDER_CLASSES) }
 
-            Log.i(TAG, "Age/gender model initialized (FaceXFormer 224×224, 4 threads)")
+            // PR 10 diagnostic: one-shot success breadcrumb so operators can
+            // confirm via logcat that the FaceXFormer load gate cleared on a
+            // given device — paired with the gate-state diag in
+            // AudienceSensingService.aggregateAndEmit (~line 2518).
+            val loadedFrom = findOtaModelFile()?.absolutePath ?: "apk_assets:$LEGACY_MODEL_FILE"
+            Log.i(TAG, "[AgeGender] Model loaded successfully: tflite=$loadedFrom, inputSize=$MODEL_INPUT_SIZE")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize age/gender model: ${e.message}")
+            Log.w(TAG, "[AgeGender] Model NOT loaded: initialize() threw ${e.javaClass.simpleName}: ${e.message} — " +
+                "on_device_demographics will remain null")
             false
         }
     }
@@ -419,6 +480,32 @@ class AgeGenderProcessor(private val context: Context) {
     }
 
     /**
+     * Phase 1c — accumulate alongside the per-face overlay so the
+     * AudienceAnalyzer can thread age/gender into PerFaceAttention
+     * buckets by ML Kit face track ID. The histogram counters still
+     * update (preserves the existing aggregate emit). When the same
+     * faceId is sampled multiple times in a window, the latest result
+     * wins — older samples are statistically aggregated via the
+     * histogram anyway, and keeping a list per face explodes memory on
+     * long dwell faces.
+     */
+    fun accumulateWithFaceId(faceId: Int, result: AgeGenderResult) {
+        accumulate(result)
+        perFaceLatest[faceId] = result
+    }
+
+    /**
+     * Phase 1c — read the per-face overlay (latest age/gender result per
+     * ML Kit face track ID). Returns a snapshot copy so the caller can
+     * iterate without worrying about concurrent mutation.
+     */
+    fun getPerFaceLatestSnapshot(): Map<Int, AgeGenderResult> {
+        val snap = mutableMapOf<Int, AgeGenderResult>()
+        for ((k, v) in perFaceLatest) snap[k] = v
+        return snap
+    }
+
+    /**
      * Get the accumulated age distribution as normalized percentages.
      */
     fun getAgeDistribution(): JSONObject {
@@ -457,6 +544,8 @@ class AgeGenderProcessor(private val context: Context) {
         genderAccumulator.fill(0)
         totalFacesProcessed = 0
         totalConfidence = 0f
+        // Phase 1c — per-face overlay also resets at window boundaries.
+        perFaceLatest.clear()
     }
 
     /**

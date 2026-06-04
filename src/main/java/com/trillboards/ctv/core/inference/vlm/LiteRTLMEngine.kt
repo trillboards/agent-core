@@ -84,6 +84,9 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
         private const val CLASS_CONTENTS = "com.google.ai.edge.litertlm.Contents"
         private const val CLASS_MESSAGE = "com.google.ai.edge.litertlm.Message"
 
+        // OpenApiTool class name — available in LiteRT-LM v0.12.0 for function-calling
+        private const val CLASS_OPEN_API_TOOL = "com.google.ai.edge.litertlm.OpenApiTool"
+
         /**
          * Check if the LiteRT-LM SDK is available at runtime.
          * With runtimeOnly dependency, the classes are in the APK classloader
@@ -223,39 +226,85 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 backendCpuClass.getDeclaredConstructor().newInstance()
             }
 
-            // Create vision backend (GPU preferred for image processing)
-            val visionBackend = try {
+            // Create vision backend (GPU preferred for image processing).
+            //
+            // SKIP for text-only LLM paths. A non-null visionBackend makes the
+            // litertlm runtime probe the model for TF_LITE_VISION_ENCODER, which
+            // text-only models (FunctionGemma 270M, EmbeddingGemma 300M, etc.)
+            // do not contain — the engine init then throws:
+            //
+            //   NOT_FOUND: TF_LITE_VISION_ENCODER not found in the model.
+            //
+            // Use config.toolsJsonSchema as the proxy: callers that pass a tool
+            // schema are the OnDeviceLlmInsightExtractor (text-only) path; the
+            // VLM path (gemma_4_e2b) leaves it null and gets the GPU vision
+            // backend. If/when a VLM also wants tools, split into an explicit
+            // VLMConfig.hasVisionBackend flag.
+            val visionBackend: Any? = if (config.toolsJsonSchema != null) {
+                Log.i(TAG, "Text-only LLM path (toolsJsonSchema set) — skipping visionBackend")
+                null
+            } else try {
                 backendGpuClass.getDeclaredConstructor().newInstance()
             } catch (e: Exception) {
                 Log.w(TAG, "GPU vision backend init failed, using CPU: ${e.message}")
                 backendCpuClass.getDeclaredConstructor().newInstance()
             }
 
-            // Build EngineConfig(modelPath, backend, visionBackend, audioBackend, contextLength, cacheDir)
-            // Actual constructor: (String, Backend, Backend?, Backend?, Integer?, String?)
+            // Build EngineConfig. Signature varies by litertlm-android SDK version:
+            //   v0.12.0: 7-arg public ctor (String, Backend, Backend, Backend, Integer, Integer, String)
+            //            = (modelPath, backend, visionBackend, audioBackend,
+            //               maxNumTokens, maxNumImages, cacheDir)
+            //            Verified 2026-05-29 via javap on
+            //            litertlm-android-0.12.0.aar/classes.jar/EngineConfig.class.
+            //   v0.11.x: 6-arg ctor — same fields minus maxNumImages.
+            //   v0.9.x:  4-arg ctor — (modelPath, backend, visionBackend, cacheDir).
+            //   pre-0.9: 2-arg ctor — (modelPath, backend).
+            // Reflection cascades highest → lowest. We declare litertlm 0.12.0 in
+            // build.gradle.kts (PR L1, #6352) so 7-arg should always win in prod;
+            // the lower-arg fallbacks remain so an SDK downgrade doesn't crash on
+            // boot. The previous code stopped at 6-arg and silently failed when
+            // FunctionGemma 270M tried to initialize against the 0.12 SDK on a
+            // live Tab S11 (2026-05-29 logcat: "Array contains no element matching
+            // the predicate" → OnDeviceLlmInsightExtractor.loadModel failed → speech
+            // pipeline fell through to regex/Gemini for every transcript).
             val cacheDir = File(context.cacheDir, "litertlm_cache").also { it.mkdirs() }
             val engineConfig = try {
-                // Full 6-arg constructor
-                engineConfigClass.constructors.first { it.parameterCount == 6 }
+                // 7-arg constructor for litertlm 0.12+
+                engineConfigClass.constructors.first { it.parameterCount == 7 }
                     .newInstance(
                         modelPath,                  // modelPath: String
                         backend,                    // backend: Backend
-                        visionBackend,              // visionBackend: Backend?
+                        visionBackend,              // visionBackend: Backend
                         null,                       // audioBackend: Backend? (not needed)
-                        null,                       // contextLength: Integer? (use default)
+                        null,                       // maxNumTokens: Integer? (use default)
+                        null,                       // maxNumImages: Integer? (use default)
                         cacheDir.absolutePath        // cacheDir: String?
                     )
             } catch (e: Exception) {
-                Log.w(TAG, "6-arg EngineConfig failed, trying 4-arg: ${e.message}")
-                // Fallback: try (modelPath, backend, visionBackend, cacheDir)
+                Log.w(TAG, "7-arg EngineConfig failed, trying 6-arg: ${e.message}")
                 try {
-                    engineConfigClass.constructors.first { it.parameterCount == 4 }
-                        .newInstance(modelPath, backend, visionBackend, cacheDir.absolutePath)
+                    // 6-arg constructor for litertlm 0.11.x
+                    engineConfigClass.constructors.first { it.parameterCount == 6 }
+                        .newInstance(
+                            modelPath,                  // modelPath: String
+                            backend,                    // backend: Backend
+                            visionBackend,              // visionBackend: Backend?
+                            null,                       // audioBackend: Backend? (not needed)
+                            null,                       // contextLength: Integer? (use default)
+                            cacheDir.absolutePath        // cacheDir: String?
+                        )
                 } catch (e2: Exception) {
-                    Log.w(TAG, "4-arg also failed, trying 2-arg: ${e2.message}")
-                    // Minimal: (modelPath, backend)
-                    engineConfigClass.constructors.first { it.parameterCount == 2 }
-                        .newInstance(modelPath, backend)
+                    Log.w(TAG, "6-arg EngineConfig failed, trying 4-arg: ${e2.message}")
+                    // Fallback: try (modelPath, backend, visionBackend, cacheDir)
+                    try {
+                        engineConfigClass.constructors.first { it.parameterCount == 4 }
+                            .newInstance(modelPath, backend, visionBackend, cacheDir.absolutePath)
+                    } catch (e3: Exception) {
+                        Log.w(TAG, "4-arg also failed, trying 2-arg: ${e3.message}")
+                        // Minimal: (modelPath, backend)
+                        engineConfigClass.constructors.first { it.parameterCount == 2 }
+                            .newInstance(modelPath, backend)
+                    }
                 }
             }
 
@@ -265,20 +314,32 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
             engineClass.getMethod("initialize").invoke(newEngine)
             engine = newEngine
 
-            // Create SamplerConfig(topK, topP, temperature) -- order may vary by SDK version
+            // Create SamplerConfig. litertlm 0.12 ctor (verified 2026-05-29 via
+            // javap on the cached .aar): (int topK, double topP, double temperature, int seed).
+            // 4-arg primitive — NOT the prior assumed 3-arg with mixed types.
+            // The pre-0.12 fallback (3-arg) stays for SDK downgrade safety.
             val samplerConfig = try {
-                // Try finding constructor with 3 params
-                val ctor = samplerConfigClass.constructors.first { it.parameterCount == 3 }
-                // Kotlin data class: constructor params are boxed types
-                ctor.newInstance(SensingConfig.get().vlm.topK, SensingConfig.get().vlm.topP, config.temperature)
+                // 4-arg (int, double, double, int) for litertlm 0.12+
+                val ctor = samplerConfigClass.constructors.first { it.parameterCount == 4 }
+                ctor.newInstance(
+                    SensingConfig.get().vlm.topK,                  // Int
+                    SensingConfig.get().vlm.topP.toDouble(),       // Double (was Float)
+                    config.temperature.toDouble(),                  // Double (was Float)
+                    0                                               // Int seed (0 = SDK default)
+                )
             } catch (e: Exception) {
-                Log.w(TAG, "3-arg SamplerConfig failed: ${e.message}")
+                Log.w(TAG, "4-arg SamplerConfig failed, trying 3-arg: ${e.message}")
                 try {
-                    // Try named-style: SamplerConfig() + property setters
-                    samplerConfigClass.getDeclaredConstructor().newInstance()
+                    val ctor = samplerConfigClass.constructors.first { it.parameterCount == 3 }
+                    ctor.newInstance(SensingConfig.get().vlm.topK, SensingConfig.get().vlm.topP, config.temperature)
                 } catch (e2: Exception) {
-                    Log.w(TAG, "Default SamplerConfig also failed: ${e2.message}")
-                    null
+                    Log.w(TAG, "3-arg SamplerConfig failed, trying default: ${e2.message}")
+                    try {
+                        samplerConfigClass.getDeclaredConstructor().newInstance()
+                    } catch (e3: Exception) {
+                        Log.w(TAG, "Default SamplerConfig also failed: ${e3.message}")
+                        null
+                    }
                 }
             }
 
@@ -300,24 +361,37 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 null
             }
 
+            // Optionally build an OpenApiTool for constrained function-calling.
+            // Used by OnDeviceLlmInsightExtractor (FunctionGemma 270M, automaticToolCalling=false).
+            // When toolsJsonSchema is null the existing VLM path (gemma_4_e2b) is unaffected.
+            val toolsList: List<Any>? = if (config.toolsJsonSchema != null) {
+                buildOpenApiToolList(config.toolsJsonSchema)
+            } else {
+                null
+            }
+            val automaticToolCalling = if (config.toolsJsonSchema != null) {
+                config.automaticToolCalling
+            } else {
+                true // default — preserve existing behaviour
+            }
+
             // Create ConversationConfig
             val convConfig = if (systemInstruction != null) {
                 try {
                     // Try full constructor: (systemInstruction, initialMessages, samplerConfig, tools, automaticToolCalling)
                     // Simpler: find a constructor that takes Contents + SamplerConfig
-                    val contentsReturnType = systemInstruction.javaClass
                     conversationConfigClass.constructors.firstOrNull { ctor ->
                         ctor.parameterCount >= 2
                     }?.let { ctor ->
                         // Use named-parameter-style reflection for Kotlin data class
-                        // ConversationConfig(systemInstruction=..., samplerConfig=...)
+                        // ConversationConfig(systemInstruction=..., samplerConfig=..., tools=..., automaticToolCalling=...)
                         conversationConfigClass.getDeclaredConstructor(
                             systemInstruction.javaClass,  // systemInstruction: Contents?
                             List::class.java,              // initialMessages: List<Message>?
                             samplerConfigClass,            // samplerConfig: SamplerConfig?
                             List::class.java,              // tools: List<Tool>?
                             Boolean::class.java            // automaticToolCalling: Boolean
-                        ).newInstance(systemInstruction, null, samplerConfig, null, true)
+                        ).newInstance(systemInstruction, null, samplerConfig, toolsList, automaticToolCalling)
                     } ?: run {
                         // Fallback: just SamplerConfig
                         conversationConfigClass.getDeclaredConstructor(samplerConfigClass)
@@ -371,6 +445,98 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create LiteRT-LM engine: ${e.message}", e)
             return false
+        }
+    }
+
+    /**
+     * Build a single-element [List] wrapping an [OpenApiTool] instance, constructed
+     * via reflection from [toolsJsonSchema].
+     *
+     * The [OpenApiTool] is injected as the 4th positional arg to [ConversationConfig]
+     * (the `tools: List<Tool>?` parameter). When [config.automaticToolCalling] is
+     * false the SDK returns the tool-call JSON as the raw response text, which
+     * [OnDeviceLlmInsightExtractor] then parses.
+     *
+     * Falls back to null (no tools) if the [OpenApiTool] class is not found —
+     * e.g. on an older LiteRT-LM SDK version — and logs a warning.
+     *
+     * @param schemaJson JSON Schema string for the EmitSpeechInsights tool parameters.
+     * @return A [List] containing one [OpenApiTool], or null on reflection failure.
+     */
+    private fun buildOpenApiToolList(schemaJson: String): List<Any>? {
+        return try {
+            val toolClass = Class.forName(CLASS_OPEN_API_TOOL)
+            // litertlm 0.12: OpenApiTool is an INTERFACE (verified 2026-05-29
+            // via javap on the cached .aar):
+            //
+            //   public interface com.google.ai.edge.litertlm.OpenApiTool {
+            //     public abstract String getToolDescriptionJsonString();
+            //     public abstract String execute(String);
+            //   }
+            //
+            // The previous reflection used getDeclaredConstructor(String, String, String)
+            // which threw NoSuchMethodException because interfaces have no constructors.
+            // Build a Proxy that implements the interface. The SDK calls
+            // getToolDescriptionJsonString() to build the prompt grammar; execute()
+            // is called only if automaticToolCalling=true (we set false in
+            // OnDeviceLlmInsightExtractor so the raw tool-call JSON arrives in the
+            // response text for our own parser).
+            val descriptionJson = """
+                {
+                  "name": "EmitSpeechInsights",
+                  "description": "Emit structured speech insights extracted from a retail conversation transcript.",
+                  "parameters": $schemaJson
+                }
+            """.trimIndent()
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                toolClass.classLoader,
+                arrayOf(toolClass)
+            ) { _, method, args ->
+                when (method.name) {
+                    "getToolDescriptionJsonString" -> descriptionJson
+                    // execute(String) — return empty result string; SDK will fold
+                    // this back into the model context if automaticToolCalling=true.
+                    // OnDeviceLlmInsightExtractor sets automaticToolCalling=false so
+                    // execute() is never invoked in our flow; keep the impl safe.
+                    "execute" -> ""
+                    // Object methods (toString/hashCode/equals) — sensible defaults.
+                    "toString" -> "OpenApiTool(EmitSpeechInsights)"
+                    "hashCode" -> System.identityHashCode(args)
+                    "equals" -> (args?.getOrNull(0) === this)
+                    else -> null
+                }
+            }
+
+            // CRITICAL: wrap the OpenApiTool with ToolKt.tool(...) to get a ToolProvider.
+            // ConversationConfig.tools is declared `List<? extends ToolProvider>`. The
+            // SDK's native bridge resolves tools via ToolProvider.provideTools$...() →
+            // InternalJsonTool. Passing a raw OpenApiTool directly silently produces
+            // tools=[] at the native layer because of Kotlin's covariant List type-erasure.
+            //
+            // Concrete symptom verified on Tab S11 (2026-05-29) BEFORE this fix:
+            // FunctionGemma 270M emitted "<start_function_call>call EmitSpeechInsights"
+            // (44 chars, ~11 tokens) and stopped — the model knew to call the tool but
+            // the runtime had no registered tool to bridge to, so generation halted.
+            //
+            // The wrapper is the top-level Kotlin function
+            //   public static ToolProvider ToolKt.tool(OpenApiTool openApiTool)
+            // verified via javap on litertlm-android-0.12.0.aar/classes.jar/ToolKt.class.
+            val toolKtClass = Class.forName("com.google.ai.edge.litertlm.ToolKt")
+            val toolFactoryMethod = toolKtClass.methods.first { m ->
+                m.name == "tool" && m.parameterTypes.size == 1 &&
+                    m.parameterTypes[0].name == "com.google.ai.edge.litertlm.OpenApiTool"
+            }
+            val toolProvider = toolFactoryMethod.invoke(null, proxy)
+            Log.i(TAG, "Wrapped OpenApiTool proxy in ToolProvider: ${toolProvider?.javaClass?.simpleName}")
+            listOf(toolProvider)
+        } catch (e: ClassNotFoundException) {
+            Log.w(TAG, "OpenApiTool class not found — LiteRT-LM SDK may be older than v0.12.0. " +
+                "Falling back to unguided generation (no tool injection).")
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to construct OpenApiTool proxy: ${e.message}. " +
+                "Falling back to unguided generation.")
+            null
         }
     }
 
@@ -499,7 +665,49 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
             val message = sendMethod.invoke(conv, prompt, emptyMap<String, Any>()) ?: return ""
             Log.d(TAG, "Got Message: ${message.javaClass.name}")
 
-            // Extract text from Message
+            // ── Tool-call extraction (FunctionGemma path) ─────────────────────
+            //
+            // FunctionGemma 270M emits the function-call sentinel
+            // (`<start_function_call>call <name>`) as a *stop sequence* — the
+            // SDK halts generation there and surfaces the parsed call via
+            // Message.getToolCalls() (List<ToolCall>) where each ToolCall has
+            // getName() and getArguments() : Map<String, Any>. Verified via
+            // javap on litertlm-android-0.12.0.aar/classes.jar/Message.class.
+            //
+            // The raw `getText()` for a tool-emitting model therefore returns
+            // only `<start_function_call>call EmitSpeechInsights` (~44 chars,
+            // 11 tokens) with no args body — that's the prefix BEFORE the
+            // halt. The args body lives in toolCalls[0].arguments.
+            //
+            // Live Tab S11 verified this 2026-05-29: every speech window
+            // logged `VLM raw response (44 chars): <start_function_call>...`
+            // and `parseSuccess=false, fields=0` UNTIL this branch was added.
+            //
+            // Strategy: when toolCalls is non-empty, serialize the first
+            // call's arguments map to a JSON object string and return THAT as
+            // the response text. VLMResponseParser then runs JSON.parse on it
+            // and the existing OnDeviceLlmInsightExtractor → SpeechInsights
+            // mapping picks up every field. When toolCalls is empty (non-tool
+            // model path, e.g. gemma_4_e2b VLM) we fall back to getText() —
+            // zero behaviour change for the VLM camera-frame pipeline.
+            val getToolCalls = message.javaClass.methods.firstOrNull { it.name == "getToolCalls" }
+            val toolCalls = getToolCalls?.invoke(message) as? List<*>
+            if (!toolCalls.isNullOrEmpty()) {
+                val firstCall = toolCalls.first()!!
+                val getName = firstCall.javaClass.methods.firstOrNull { it.name == "getName" }
+                val getArguments = firstCall.javaClass.methods.firstOrNull { it.name == "getArguments" }
+                val name = getName?.invoke(firstCall)?.toString() ?: "?"
+                @Suppress("UNCHECKED_CAST")
+                val args = getArguments?.invoke(firstCall) as? Map<String, Any?> ?: emptyMap()
+                // Serialise args -> JSON. Map<String, Any> handles nested Maps,
+                // Lists, primitives via org.json's JSONObject(map) ctor.
+                val argsJson = org.json.JSONObject(args).toString()
+                Log.d(TAG, "Tool-call extracted: name=$name, argsKeys=${args.keys}, argsJsonLen=${argsJson.length}")
+                Log.d(TAG, "VLM tool-call response (${argsJson.length} chars): ${argsJson.take(300)}")
+                return argsJson
+            }
+
+            // Extract text from Message (existing path for non-tool models)
             val getText = message.javaClass.methods.firstOrNull { it.name == "getText" }
             val text = getText?.invoke(message)?.toString() ?: message.toString()
             Log.d(TAG, "VLM raw response (${text.length} chars): ${text.take(300)}")

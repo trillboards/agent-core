@@ -136,6 +136,27 @@ class FrameCaptureManager(
     // Edge intelligence context — VLM + TFLite signals for Gemini cloud enrichment
     var edgeIntelligenceProvider: (() -> JSONObject?)? = null
 
+    // Phase 1c → POP path bridge. AudienceSensingService aggregates per-frame
+    // attention into perAdAttention buckets and drains them at WS-emit time;
+    // FrameCaptureManager now mirrors that drained snapshot onto the HTTP
+    // POST body so the cloud's audienceMetricsService (which writes
+    // observation_stream.per_face_observations from the HTTP request, not the
+    // WS feed) actually sees it. Without this, the WS path emits per-face
+    // rows that the persistence layer never reads — fleet-wide 0% fill bug
+    // discovered 2026-05-11. Provider returns the LAST drained array, never
+    // null (empty JSONArray when no data accumulated).
+    var perFaceSnapshotProvider: (() -> org.json.JSONArray?)? = null
+
+    // Content state provider — supplies currentAdId + currentImpressionId at capture
+    // time so the JPEG-bearing REST POST to /v2/earner/audience-analyze carries the
+    // same ad-audience correlation keys the socket aggregation path already sends.
+    // Without this, observation_stream / audience_metrics / scene_embeddings rows
+    // produced from REST captures cannot join to a specific ad. Phase 1b
+    // (FEIN REST/Socket bridge). Injection mirrors edgeQualityProvider /
+    // edgeIntelligenceProvider: AudienceSensingService wires the lambda after
+    // it owns a ContentStateProvider instance from the tablet agent.
+    var contentStateProvider: ContentStateProvider? = null
+
     /**
      * Set the ImageCapture use case from AudienceAnalyzer.
      * This is required because CameraX only allows one camera binding,
@@ -470,6 +491,13 @@ class FrameCaptureManager(
                     ?.invoke()
                     ?.let { ObservationSignalClassifier.applyCaptureModeOverride(it, currentCaptureMode) }
 
+                // Phase 1b: pull current content state so the REST JPEG carries the
+                // same ad-audience correlation keys as the socket aggregation. Reading
+                // once at payload-build time keeps the field consistent for the entire
+                // window the cloud reasons over this capture. ContentStateProvider is
+                // null on android-tv builds (idle-only); resolves on tablet-agent.
+                val contentState = contentStateProvider?.getCurrentContentState()
+
                 val payload = JSONObject().apply {
                     put("fingerprint", fingerprint)
                     put("screenId", screenId)
@@ -478,6 +506,12 @@ class FrameCaptureManager(
                     put("imageWidth", MAX_IMAGE_WIDTH)
                     put("imageHeight", MAX_IMAGE_HEIGHT)
                     put("captureMode", currentCaptureMode)
+                    // Ad-audience correlation (Phase 1b — bridge REST/Socket data path).
+                    // Top-level fields keep the wire payload flat; server reads from
+                    // either top-level OR req.body.audienceSignals for backward compat.
+                    put("currentAdId", contentState?.adId ?: JSONObject.NULL)
+                    put("currentImpressionId", contentState?.impressionId ?: JSONObject.NULL)
+                    put("currentContentType", contentState?.contentType ?: JSONObject.NULL)
                     effectiveEdgeQuality?.let { edgeQuality ->
                         put("observationFamily", edgeQuality.observationFamily)
                         put("evidenceGrade", edgeQuality.evidenceGrade)
@@ -495,6 +529,19 @@ class FrameCaptureManager(
                     // Edge intelligence context — VLM + TFLite signals for Gemini cloud enrichment
                     edgeIntelligenceProvider?.invoke()?.let { edgeCtx ->
                         put("edgeContext", edgeCtx)
+                    }
+                    // Phase 1c per-(face × creative) attention snapshot. WHEN
+                    // non-empty, the cloud's audienceMetricsService fans these
+                    // out into observation_field_values rows + persists the
+                    // raw JSONB onto observation_stream.per_face_observations.
+                    // Empty array is safe (cloud-side guard: arr.length === 0
+                    // → skip persist path). Includes creative_id + creative_source
+                    // so attribution distinguishes IMA programmatic from
+                    // self_promo / sponsored / default_stream loop items.
+                    perFaceSnapshotProvider?.invoke()?.let { arr ->
+                        if (arr.length() > 0) {
+                            put("per_face_observations", arr)
+                        }
                     }
                 }
 
@@ -639,6 +686,10 @@ class FrameCaptureManager(
             }
         }
 
+        // Phase 5d: parse operator-defined dynamic fields from cloud Gemini response
+        // (e.g. politeness_score for bartender_politeness_monitor program).
+        val profileFields = response.optJSONObject("profile_fields")
+
         // Log enhanced fields at debug level
         Log.d(TAG, "[FrameCapture] Enhanced targeting: " +
                 "income=${incomeSignalsObj?.optString("estimatedLevel") ?: "n/a"}, " +
@@ -646,7 +697,8 @@ class FrameCaptureManager(
                 "segments=$allLifestyleSegments, " +
                 "groups=${groupComposition != null}, " +
                 "purchaseIntent=${purchaseIntent?.optString("category") ?: "n/a"}, " +
-                "mood=${behavioralContext?.optString("primaryMood") ?: "n/a"}")
+                "mood=${behavioralContext?.optString("primaryMood") ?: "n/a"}, " +
+                "profileFields=${profileFields?.keys()?.asSequence()?.toList() ?: "n/a"}")
 
         return DemographicsResult(
             estimatedViewerCount = response.optInt("estimatedViewerCount", 0),
@@ -701,7 +753,9 @@ class FrameCaptureManager(
             },
             edgeQualityJson = response.optJSONObject("edgeQuality"),
             captureMode = if (response.has("captureMode") && !response.isNull("captureMode")) response.getString("captureMode") else currentCaptureMode,
-            analysisTimestamp = System.currentTimeMillis()
+            analysisTimestamp = System.currentTimeMillis(),
+            // Phase 5d: forward operator-defined dynamic fields to the device
+            profileFields = profileFields
         )
     }
 
@@ -789,6 +843,11 @@ data class DemographicsResult(
     val edgeQualityJson: JSONObject? = null,
     val captureMode: String? = null,  // "face_triggered" or "periodic_scene"
 
+    // Phase 5d: operator-defined dynamic fields from cloud Gemini Vision
+    // (e.g. politeness_score, custom fields compiled from operator NL prompts).
+    // Null when the server response carries no profile_fields object.
+    val profileFields: JSONObject? = null,
+
     val analysisTimestamp: Long
 ) {
     /**
@@ -861,6 +920,9 @@ data class DemographicsResult(
         put("decisionBlockReasons", org.json.JSONArray(decisionBlockReasons))
         edgeQualityJson?.let { put("edgeQuality", it) }
         captureMode?.let { put("captureMode", it) }
+        // Phase 5d: serialize operator-defined dynamic fields so they survive
+        // the round-trip through audienceSignals → analytics consumers.
+        profileFields?.let { put("profile_fields", it) }
     }
 
     override fun toString(): String {

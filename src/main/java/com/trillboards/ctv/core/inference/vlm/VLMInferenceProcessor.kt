@@ -70,7 +70,7 @@ import java.io.File
  */
 class VLMInferenceProcessor(
     private val context: Context?,
-    override val modelId: String = "gemma_3n_e2b",
+    override val modelId: String = "gemma_4_e2b",
     private val metricsPrompt: String,
     private val modelPath: String,
     private val modelFormat: String = "litert-lm",

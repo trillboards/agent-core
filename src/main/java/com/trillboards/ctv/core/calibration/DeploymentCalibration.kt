@@ -20,8 +20,8 @@ import kotlin.math.atan2
  * class computes the correct thresholds automatically.
  *
  * The derived thresholds are applied to SensingConfig.gaze and SensingConfig.body via
- * the existing updateFromJson mechanism, so all downstream processors (GazeTrackingProcessor,
- * PoseEngagementProcessor) pick them up transparently.
+ * the existing updateFromJson mechanism, so all downstream processors (FaceLandmarkerProcessor
+ * gaze consumers, PoseEngagementProcessor) pick them up transparently.
  */
 class DeploymentCalibration private constructor() {
 

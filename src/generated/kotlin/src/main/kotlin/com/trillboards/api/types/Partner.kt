@@ -28,7 +28,7 @@ import kotlinx.serialization.Contextual
  * @param integrationTier 
  * @param name 
  * @param partnerId 
- * @param partnerType 
+ * @param partnerType Legacy classification retained for existing integrations. New integrations should not branch on this field.
  * @param revenueSharePercent 
  * @param sdkConfig 
  * @param slug 
@@ -49,7 +49,9 @@ data class Partner (
     @SerialName(value = "partner_id")
     val partnerId: kotlin.String? = null,
 
+    /* Legacy classification retained for existing integrations. New integrations should not branch on this field. */
     @SerialName(value = "partner_type")
+    @Deprecated(message = "This property is deprecated.")
     val partnerType: kotlin.String? = null,
 
     @SerialName(value = "revenue_share_percent")

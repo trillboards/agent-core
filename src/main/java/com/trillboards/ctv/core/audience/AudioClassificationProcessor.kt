@@ -72,6 +72,26 @@ class AudioClassificationProcessor(
         private val QUIET_CLASSES = setOf(
             "silence", "quiet", "white noise", "pink noise", "static"
         )
+
+        // YAMNet event-class triggers for `audio_class_event_counts` raw scalar.
+        // Each label is matched substring-style (lowercased) against YAMNet's
+        // category labels. When a category clears the score threshold and
+        // matches one of these, we increment the corresponding count for the
+        // window. Used as honest behavioral evidence (laughter, applause,
+        // footsteps) — replaces the fabricated occupancy buckets.
+        private val EVENT_CLASS_KEYWORDS = mapOf(
+            "footstep" to listOf("footstep", "footsteps", "walk"),
+            "laughter" to listOf("laugh", "giggle", "chuckle", "snicker"),
+            "applause" to listOf("applause", "clapping"),
+            "cheer" to listOf("cheer", "shout", "yell"),
+            "gasp" to listOf("gasp")
+        )
+
+        // PCM_FLOAT samples ride [-1, 1] full-scale (Android docs).
+        // dBFS = 20·log10(rms) — full-scale silence = -∞, full-scale tone = 0 dBFS.
+        // We clamp to a noise floor so silence doesn't return -Infinity / NaN
+        // and bury the wire serializer.
+        private const val DBFS_FLOOR = -120f
     }
 
     private val classificationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -342,8 +362,23 @@ class AudioClassificationProcessor(
                                 )
                             }
 
+                            // Compute honest raw scalars from the PCM window:
+                            // peak/mean dBFS over the 0.975s window, plus event
+                            // counts derived from above-threshold YAMNet classes.
+                            // These replace the fabricated occupancy bucket
+                            // strings (cosmic-brewing-bear C1).
+                            val (dbMax, dbMean) = computeDbScalars(samples, readSamples)
+                            val voiceCount = estimateCrowdVoiceCount(categories)
+                            val eventCounts = countEventClasses(categories)
+
                             // Analyze classifications
-                            val metrics = analyzeClassifications(categories)
+                            val metrics = analyzeClassifications(
+                                categories,
+                                audioDbMax = dbMax,
+                                audioDbMean = dbMean,
+                                crowdVoiceCountEstimate = voiceCount,
+                                audioClassEventCounts = eventCounts
+                            )
                             _currentMetrics.value = metrics
 
                             // Invoke callback
@@ -483,9 +518,18 @@ class AudioClassificationProcessor(
 
     /**
      * Analyze classification results to extract meaningful metrics.
+     *
+     * Raw scalars (audioDbMax, audioDbMean, crowdVoiceCountEstimate,
+     * audioClassEventCounts) are computed by the caller from the PCM window
+     * + classification output and threaded through here so the AudioMetrics
+     * snapshot is the single source of truth for downstream consumers.
      */
     private fun analyzeClassifications(
-        categories: List<org.tensorflow.lite.support.label.Category>
+        categories: List<org.tensorflow.lite.support.label.Category>,
+        audioDbMax: Float,
+        audioDbMean: Float,
+        crowdVoiceCountEstimate: Int?,
+        audioClassEventCounts: Map<String, Int>
     ): AudioMetrics {
         val timestamp = System.currentTimeMillis()
 
@@ -534,13 +578,10 @@ class AudioClassificationProcessor(
             else -> "ambient"
         }
 
-        // Derived signal: Estimate occupancy from audio patterns
-        val estimatedOccupancy = when {
-            ambientNoiseTier >= NOISE_TIER_VERY_HIGH && isCrowded -> "50+"
-            ambientNoiseTier >= NOISE_TIER_HIGH && isCrowded -> "20-50"
-            ambientNoiseTier >= NOISE_TIER_MODERATE -> "5-20"
-            else -> "0-5"
-        }
+        // Magic-string occupancy buckets ("0-5"/"5-20"/"20-50"/"50+") were
+        // mic-noise-tier proxies masquerading as occupancy data — deleted in
+        // cosmic-brewing-bear C1. Honest raw scalars (audioDbMax, audioDbMean,
+        // crowdVoiceCountEstimate, audioClassEventCounts) replace them.
 
         // Ad receptivity = weighted(audience_size, attention, viewer_presence)
         // Server-tunable via SensingConfig — breaks old 2-factor compression (3 collapsed values)
@@ -582,10 +623,101 @@ class AudioClassificationProcessor(
             isMusicPlaying = isMusicPlaying,
             hasSpeech = hasSpeech,
             ambienceType = ambienceType,
-            estimatedOccupancy = estimatedOccupancy,
             adReceptivityScore = adReceptivityScore,
-            inferredVenueType = inferredVenueType
+            inferredVenueType = inferredVenueType,
+            audioDbMax = audioDbMax,
+            audioDbMean = audioDbMean,
+            crowdVoiceCountEstimate = crowdVoiceCountEstimate,
+            audioClassEventCounts = audioClassEventCounts
         )
+    }
+
+    /**
+     * Compute peak / mean dBFS scalars over a PCM_FLOAT window. Float samples
+     * are full-scale [-1, 1]; we compute peak |x| and RMS, convert to dBFS,
+     * and clamp to a noise floor (DBFS_FLOOR) so silence doesn't propagate
+     * -Infinity / NaN onto the wire. Returns Pair(dbMax, dbMean).
+     *
+     * Note: dBFS is digital-domain (relative to full-scale), NOT calibrated
+     * SPL. The wire fields are named `audio_db_*` for parity with what the
+     * cosmic-brewing-bear plan calls "peak SPL" — calibrating dBFS → dB-SPL
+     * needs per-device mic gain tables we don't have today, so we ship the
+     * uncalibrated dBFS value and let the server interpret deltas, not
+     * absolutes.
+     */
+    internal fun computeDbScalars(samples: FloatArray, readSamples: Int): Pair<Float, Float> {
+        if (readSamples <= 0) return Pair(DBFS_FLOOR, DBFS_FLOOR)
+        var peak = 0f
+        var sumSquares = 0.0
+        val n = readSamples.coerceAtMost(samples.size)
+        for (i in 0 until n) {
+            val s = samples[i]
+            val a = if (s < 0f) -s else s
+            if (a > peak) peak = a
+            sumSquares += s.toDouble() * s.toDouble()
+        }
+        val rms = if (n > 0) kotlin.math.sqrt(sumSquares / n.toDouble()) else 0.0
+        val dbMax = if (peak > 0f) {
+            (20.0 * kotlin.math.log10(peak.toDouble())).toFloat().coerceAtLeast(DBFS_FLOOR)
+        } else DBFS_FLOOR
+        val dbMean = if (rms > 0.0) {
+            (20.0 * kotlin.math.log10(rms)).toFloat().coerceAtLeast(DBFS_FLOOR)
+        } else DBFS_FLOOR
+        return Pair(dbMax, dbMean)
+    }
+
+    /**
+     * Estimate distinct voice clusters from YAMNet output. Returns null when
+     * no speech-class category clears the confidence threshold — null is the
+     * honest answer ("we couldn't tell"), not 0 (which would assert "we know
+     * there are zero voices"). When confident speech is present we return 1
+     * (single-voice baseline); higher counts require diarization which YAMNet
+     * alone can't provide. Diarization integration is a separate workstream;
+     * this scaffolding keeps the wire field consistent.
+     */
+    internal fun estimateCrowdVoiceCount(
+        categories: List<org.tensorflow.lite.support.label.Category>
+    ): Int? {
+        val minConfidence = SensingConfig.get().audio.minClassificationConfidence
+        var hasConfidentSpeech = false
+        var hasCrowdMarker = false
+        for (category in categories) {
+            if (category.score < minConfidence) continue
+            val label = category.label.lowercase()
+            if (SPEECH_CLASSES.any { it in label }) hasConfidentSpeech = true
+            if (CROWD_CLASSES.any { it in label } &&
+                (label.contains("crowd") || label.contains("babble") ||
+                    label.contains("hubbub") || label.contains("chatter"))) {
+                hasCrowdMarker = true
+            }
+        }
+        return when {
+            hasCrowdMarker -> 2  // Crowd-noise marker → ≥2 voices, can't separate further
+            hasConfidentSpeech -> 1
+            else -> null  // Honest "no speech detected this window"
+        }
+    }
+
+    /**
+     * Count YAMNet event-class firings for the current window. A label is
+     * counted at most once per window per class so a single window can't
+     * inflate the histogram. Empty map when no event classes fire — empty,
+     * not null, so server-side merges are append-only.
+     */
+    internal fun countEventClasses(
+        categories: List<org.tensorflow.lite.support.label.Category>
+    ): Map<String, Int> {
+        val minConfidence = SensingConfig.get().audio.minClassificationConfidence
+        val counts = mutableMapOf<String, Int>()
+        for ((eventClass, keywords) in EVENT_CLASS_KEYWORDS) {
+            val fired = categories.any { category ->
+                if (category.score < minConfidence) return@any false
+                val label = category.label.lowercase()
+                keywords.any { kw -> kw in label }
+            }
+            if (fired) counts[eventClass] = 1
+        }
+        return counts
     }
 
     /**
@@ -669,6 +801,12 @@ data class AudioConfig(
 
 /**
  * Audio classification metrics with derived signals for retail media intelligence.
+ *
+ * cosmic-brewing-bear C1: the previous `estimatedOccupancy: String` field
+ * (mic-noise-tier proxy buckets "0-5"/"5-20"/"20-50"/"50+") was deleted —
+ * those four hardcoded strings masqueraded as occupancy data. Replaced by
+ * honest raw scalars (audioDbMax/audioDbMean dBFS, crowdVoiceCountEstimate,
+ * audioClassEventCounts) computed directly from PCM + YAMNet output.
  */
 data class AudioMetrics(
     val timestamp: Long = System.currentTimeMillis(),
@@ -681,9 +819,19 @@ data class AudioMetrics(
     val ambienceType: String = "unknown",  // crowded, quiet, music_playing, conversational, ambient
 
     // Derived signals for retail media network
-    val estimatedOccupancy: String = "0-5",  // "0-5", "5-20", "20-50", "50+"
     val adReceptivityScore: Float = SensingConfig.get().audio.defaultReceptivity,  // 0-1 (higher = more receptive to ads)
-    val inferredVenueType: String = "unknown"  // retail, restaurant, office, entertainment, waiting_area
+    val inferredVenueType: String = "unknown",  // retail, restaurant, office, entertainment, waiting_area
+
+    // Raw audio scalars (cosmic-brewing-bear C1) — replace the magic-string
+    // `estimatedOccupancy` buckets. dBFS is full-scale digital, NOT calibrated
+    // SPL; values flow through to the wire as `audio_db_max` / `audio_db_mean`
+    // for the server to interpret as relative deltas.
+    val audioDbMax: Float = -120f,
+    val audioDbMean: Float = -120f,
+    // null = "no confident speech this window" (honest unknown, NOT zero)
+    val crowdVoiceCountEstimate: Int? = null,
+    // empty map = "no event classes fired"; never null on the snapshot side
+    val audioClassEventCounts: Map<String, Int> = emptyMap()
 ) {
     /**
      * Compute ad receptivity with viewer presence boost.

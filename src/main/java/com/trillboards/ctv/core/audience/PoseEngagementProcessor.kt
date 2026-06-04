@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import com.trillboards.ctv.core.SensingConfig
+import com.trillboards.ctv.core.inference.DelegateSelector
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.sqrt
@@ -149,7 +150,7 @@ class PoseEngagementProcessor(
      * - [faceCount]: number of faces ML Kit detected in the frame
      * - [screenEngaged]: whether at least one face is stably looking at the
      *   screen (head yaw/pitch within engagement bounds — same logic as
-     *   GazeTrackingProcessor.isLookingAtScreen)
+     *   FaceLandmarker's HeadPose.isFacingScreen())
      *
      * Default ([NONE]) preserves the original speed-only behaviour, so
      * existing call sites that don't yet supply context continue to work.
@@ -204,31 +205,69 @@ class PoseEngagementProcessor(
             return false
         }
 
-        return try {
-            val baseOptions = BaseOptions.builder()
-                .setModelAssetPath(POSE_MODEL_FILE)
-                .setDelegate(Delegate.CPU) // CPU is more reliable across devices
-                .build()
-
-            val bodyCfg = SensingConfig.get().body
-            val options = PoseLandmarker.PoseLandmarkerOptions.builder()
-                .setBaseOptions(baseOptions)
-                .setRunningMode(RunningMode.IMAGE)
-                .setMinPoseDetectionConfidence(bodyCfg.minPoseDetectionConfidence)
-                .setMinPosePresenceConfidence(bodyCfg.minPosePresenceConfidence)
-                .setMinTrackingConfidence(bodyCfg.minTrackingConfidence)
-                .setNumPoses(3) // Detect up to 3 people
-                .build()
-
-            poseLandmarker = PoseLandmarker.createFromOptions(context, options)
-            isInitialized = true
-
-            Log.i(TAG, "Pose landmarker initialized successfully")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize pose landmarker", e)
-            false
+        // Honest GPU/NPU acceleration: live ADB on the Galaxy Tab S11
+        // (MediaTek Dimensity 9400, Mali-G720) showed Pose running on CPU
+        // XNNPack because this path used to hardcode Delegate.CPU with the
+        // comment "CPU is more reliable across devices" — that's exactly
+        // what DelegateSelector.withFallback / the test-inference loop
+        // exists to handle. Mali GPU sat idle for ~30ms/frame. Mirror the
+        // PersonDetectionProcessor.kt:88-134 pattern: try chipset-recommended
+        // delegate first with a test inference, fall back to CPU on failure.
+        val profile = DeviceProfile.detect(context)
+        val recommendation = DelegateSelector.recommendAndLog(profile.chipsetVendor, "vision")
+        val delegates = if (recommendation.primary != recommendation.fallback) {
+            listOf(recommendation.primary, recommendation.fallback)
+        } else {
+            listOf(recommendation.primary)
         }
+
+        val bodyCfg = SensingConfig.get().body
+        for (delegate in delegates) {
+            try {
+                val baseOptions = BaseOptions.builder()
+                    .setModelAssetPath(POSE_MODEL_FILE)
+                    .setDelegate(delegate)
+                    .build()
+
+                val options = PoseLandmarker.PoseLandmarkerOptions.builder()
+                    .setBaseOptions(baseOptions)
+                    .setRunningMode(RunningMode.IMAGE)
+                    .setMinPoseDetectionConfidence(bodyCfg.minPoseDetectionConfidence)
+                    .setMinPosePresenceConfidence(bodyCfg.minPosePresenceConfidence)
+                    .setMinTrackingConfidence(bodyCfg.minTrackingConfidence)
+                    .setNumPoses(3) // Detect up to 3 people
+                    .build()
+
+                val landmarker = PoseLandmarker.createFromOptions(context, options)
+
+                // Validate with a test inference — catches GPU drivers that
+                // initialize successfully but fail at runtime in the
+                // ToTensorConverter (Samsung Android 16 known issue).
+                val testBitmap = Bitmap.createBitmap(192, 192, Bitmap.Config.ARGB_8888)
+                try {
+                    val testImage = BitmapImageBuilder(testBitmap).build()
+                    try {
+                        landmarker.detect(testImage)
+                    } finally {
+                        testImage.close()
+                    }
+                    Log.i(TAG, "Delegate $delegate passed test inference")
+                } finally {
+                    if (!testBitmap.isRecycled) testBitmap.recycle()
+                }
+
+                poseLandmarker = landmarker
+                isInitialized = true
+                Log.i(TAG, "Pose landmarker initialized with delegate=$delegate")
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "Delegate $delegate failed (init or test inference): ${e.message}")
+                // Continue to next delegate
+            }
+        }
+
+        Log.e(TAG, "All delegates failed for PoseEngagementProcessor")
+        return false
     }
 
     /**
@@ -257,14 +296,42 @@ class PoseEngagementProcessor(
         val landmarker = poseLandmarker ?: return null
 
         return try {
-            val mpImage = BitmapImageBuilder(bitmap).build()
-            val result = try {
-                landmarker.detect(mpImage)
-            } finally {
-                mpImage.close()
+            // IMPORTANT: MediaPipe's BitmapImageContainer.close() (called via
+            // mpImage.close()) calls recycle() on the source bitmap. Passing the
+            // caller's bitmap directly would recycle AudienceAnalyzer's pre-allocated
+            // zero-alloc sharedBitmap, causing per-frame buffer reinit (~24×/sec).
+            // Fix mirrors PersonDetectionProcessor: pass a defensive copy to MediaPipe;
+            // recycle the copy in finally; the caller's bitmap stays alive.
+            val frameCopy = try {
+                bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to copy bitmap for pose detection: ${e.message}")
+                return null
             }
 
-            analyzePoseResult(result, bitmap.width, bitmap.height, context)
+            val bitmapWidth = bitmap.width
+            val bitmapHeight = bitmap.height
+
+            val result = try {
+                val mpImage = BitmapImageBuilder(frameCopy).build()
+                try {
+                    landmarker.detect(mpImage)
+                } finally {
+                    // mpImage.close() calls BitmapImageContainer.close() which
+                    // calls frameCopy.recycle(). The shared bitmap is unaffected
+                    // because we passed a copy.
+                    mpImage.close()
+                }
+            } finally {
+                // Defensive: if MediaPipe's BitmapImageContainer ever stops
+                // recycling on close (API change), recycle the throwaway here
+                // so we don't leak the copy per call.
+                if (!frameCopy.isRecycled) {
+                    frameCopy.recycle()
+                }
+            }
+
+            analyzePoseResult(result, bitmapWidth, bitmapHeight, context)
         } catch (e: Exception) {
             Log.e(TAG, "Pose detection error", e)
             null
@@ -466,9 +533,15 @@ class PoseEngagementProcessor(
             return 90f
         }
 
-        // Z delta indicates rotation - larger delta = more turned
+        // Z delta indicates rotation - larger delta = more turned. Always
+        // emit absolute deviation (0..90°) so downstream arithmetic-mean
+        // aggregation (AudienceAnalyzer.kt avgFacingAngle) does not cancel
+        // signed values toward zero. Every existing call site of
+        // .facingAngle (isFacingScreen line 396, calibration thresholds)
+        // already wraps abs() before comparing, so the abs() here is the
+        // canonical contract — facingAngle is unsigned deviation.
         val angleRad = atan2(shoulderDeltaZ, shoulderWidth)
-        return Math.toDegrees(angleRad.toDouble()).toFloat()
+        return abs(Math.toDegrees(angleRad.toDouble())).toFloat()
     }
 
     /**

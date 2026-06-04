@@ -273,12 +273,21 @@ class SensorCollector(private val context: Context) : SensorEventListener {
     }
 
     /**
-     * Get a viewability score based on ambient conditions.
-     * Higher score = better viewing conditions.
+     * Get an ENVIRONMENTAL factor in [0..1] reflecting whether ambient
+     * lighting is suitable for viewing. NOT a true viewability score —
+     * a real IAB MRC viewability composite requires face_count, dwell,
+     * and on-screen-pct which live in AudienceSensingService. The wire
+     * field `viewabilityScore` is computed there by combining this
+     * factor with the face/dwell/attention signals.
+     *
+     * Returns null when no light reading is available (currentLightLux < 0)
+     * — the prior `0.5f` default was a magic-fallback that masqueraded
+     * as data. Buyer-grade signals require null when missing, never
+     * a synthetic average.
      */
-    fun getViewabilityScore(): Float {
+    fun getEnvironmentalViewabilityFactor(): Float? {
         val vCfg = SensingConfig.get().viewability
-        if (currentLightLux < 0) return 0.5f  // Unknown, assume average
+        if (currentLightLux < 0) return null  // No reading — emit null, not 0.5f
 
         return when {
             currentLightLux < vCfg.darkLuxThreshold -> 0.3f      // Very dark, hard to see
@@ -288,4 +297,19 @@ class SensorCollector(private val context: Context) : SensorEventListener {
             else -> 0.5f                      // Very bright, likely outdoor glare
         }
     }
+
+    /**
+     * @deprecated Use getEnvironmentalViewabilityFactor() — this stub
+     * (lux-only bucket → 0.3/0.7/1.0/0.8/0.5) was being emitted as
+     * `viewabilityScore` on the wire, which is a buyer-grade lie because
+     * indoor lighting (50–500 lux) ALWAYS returned 1.0 regardless of
+     * actual viewability. The replacement composite lives in
+     * AudienceSensingService.computeViewabilityScore() and combines
+     * face_count, dwell, attention, and this environmental factor.
+     */
+    @Deprecated(
+        "Use getEnvironmentalViewabilityFactor() — true IAB-MRC viewability is computed in AudienceSensingService.computeViewabilityScore()",
+        ReplaceWith("getEnvironmentalViewabilityFactor()")
+    )
+    fun getViewabilityScore(): Float = getEnvironmentalViewabilityFactor() ?: 0.5f
 }

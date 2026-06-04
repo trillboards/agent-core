@@ -10,6 +10,7 @@ import java.security.MessageDigest
 import java.util.UUID
 
 object DeviceIdentity {
+    private const val TAG = "DeviceIdentity"
     private const val DEFAULT_PREFS = "trillboard_device_identity"
     private const val FINGERPRINT_VERSION = 2
     private const val FINGERPRINT_VERSION_KEY = "fingerprint_version"
@@ -23,14 +24,46 @@ object DeviceIdentity {
      *
      * When the stored version is older than FINGERPRINT_VERSION, the fingerprint
      * is recomputed and the new value is persisted.
+     *
+     * PR π (2026-06-01) — Self-heal a polluted cache.
+     * An earlier build of the registration flow wrote the COMPOSITE
+     * stableFingerprint() value (`raw_hash + "_" + installId`) back into the
+     * "fingerprint" slot used here by [fingerprint] for the RAW hash. Each
+     * subsequent registration cycle then read the already-polluted value as
+     * if it were the raw hash and appended ANOTHER `_DEV-xxxxxx` suffix —
+     * so live Tab S11 logs (2026-06-01) showed `..._DEV-b647548c` repeated
+     * four times in every audienceSignals fingerprint, which no server-side
+     * lookup could resolve.
+     *
+     * The healing rule: if the cached value contains `_DEV-` it is by
+     * definition NOT a raw SHA-256 hash (raw hashes are 64 lowercase hex
+     * chars with no underscores), so evict the cache + version sentinel and
+     * fall through to the hardware recompute. SetupWizardActivity's earlier
+     * one-shot heal still runs on first-launch (PR pre-pi); this one fires
+     * on EVERY caller of fingerprint() regardless of which activity / service
+     * boots first.
+     *
+     * Backward-compatible: a clean cached value (64 hex chars, no underscore)
+     * goes through unchanged — the heal is a no-op for healthy devices.
      */
     fun fingerprint(context: Context, prefsName: String = DEFAULT_PREFS): String {
         val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
         val version = prefs.getInt(FINGERPRINT_VERSION_KEY, 0)
         val cached = prefs.getString("fingerprint", null)
 
-        // Return cached if version is current
-        if (!cached.isNullOrEmpty() && version >= FINGERPRINT_VERSION) return cached
+        // PR π — Self-heal polluted cache. Raw fingerprints are 64 lowercase
+        // hex chars with no underscores — anything containing `_DEV-` is a
+        // composite that got mis-written back; evict and recompute.
+        if (cached != null && cached.contains("_DEV-")) {
+            Log.w(TAG, "Detected polluted fingerprint cache ('${cached.take(8)}…' contains _DEV-); evicting + recomputing")
+            prefs.edit()
+                .remove("fingerprint")
+                .remove(FINGERPRINT_VERSION_KEY)
+                .apply()
+        } else if (!cached.isNullOrEmpty() && version >= FINGERPRINT_VERSION) {
+            // Healthy cached value at current version — return as-is.
+            return cached
+        }
 
         val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
         val payload = listOf(androidId, Build.BRAND, Build.MODEL)
@@ -83,7 +116,7 @@ object DeviceIdentity {
                     .id.await()
             }
         } catch (e: Exception) {
-            Log.w("DeviceIdentity", "FID unavailable: ${e.message}")
+            Log.w(TAG, "FID unavailable: ${e.message}")
             null
         }
     }

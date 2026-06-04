@@ -2,6 +2,7 @@ package com.trillboards.ctv.core.audience
 
 import android.content.Context
 import android.util.Log
+import com.trillboards.ctv.core.SensingConfig
 import com.trillboards.ctv.core.calibration.DeploymentCalibration
 import com.trillboards.ctv.core.calibration.DerivedThresholds
 import com.trillboards.ctv.core.ml.ModelDownloadManager
@@ -44,7 +45,20 @@ class SensingProfileManager(
         val reportIntervalMs: Int = 30000,
         val vlmPrompt: String? = null,
         val programSpecJson: String? = null,
-        val programSpecVersion: String? = null
+        val programSpecVersion: String? = null,
+        // Raw sensing_config block from the push payload. Survives restart so
+        // SensingConfig overrides (speech.useLlmExtractor, vlm.* thresholds,
+        // engagement weights, etc.) re-apply on cold boot rather than reverting
+        // to Kotlin defaults. JSON string instead of parsed map because the
+        // schema is open-ended (any flag a future profile pushes). Null when
+        // the profile didn't include sensing_config (legacy path).
+        val sensingConfigJson: String? = null,
+        // Raw JSON array string of `program_spec.observation_program.signals`.
+        // Survives restart so OnDeviceLlmInsightExtractor can rebuild its
+        // OpenApiTool spec from profile signals on cold boot without waiting
+        // for the server's profile push. Null when the profile did not declare
+        // any signals (legacy profiles — back-compat preserved).
+        val signalsJson: String? = null
     )
 
     /**
@@ -99,6 +113,15 @@ class SensingProfileManager(
             val profile = parseProfile(profileJson)
             val validated = validateAgainstCapabilities(profile, capabilities)
             val current = activeProfile.get()
+            // PR π (2026-06-01) — include sensingConfigJson in the duplicate-key
+            // comparison. Before this change, a WS push or in-process restart
+            // that re-sent the same profile_id with ONLY a sensing_config delta
+            // (e.g. operator flipped speech.shadowLlmExtractor false→true) would
+            // short-circuit here BEFORE applySensingConfigOverrides ran, so the
+            // newly-pushed flags silently never took effect on already-running
+            // devices. Per Codex P1 on PR #6498 — both the persistence path
+            // (createProfile) and the apply path must respect sensing_config or
+            // the cold-boot fix is half-finished.
             if (current != null &&
                 current.profileId == validated.profileId &&
                 current.models == validated.models &&
@@ -107,7 +130,9 @@ class SensingProfileManager(
                 current.reportIntervalMs == validated.reportIntervalMs &&
                 current.vlmPrompt == validated.vlmPrompt &&
                 current.programSpecJson == validated.programSpecJson &&
-                current.programSpecVersion == validated.programSpecVersion
+                current.programSpecVersion == validated.programSpecVersion &&
+                current.signalsJson == validated.signalsJson &&
+                current.sensingConfigJson == validated.sensingConfigJson
             ) {
                 Log.i(TAG, "Skipping duplicate sensing profile: ${validated.profileName}")
                 return ApplyResult(
@@ -123,6 +148,12 @@ class SensingProfileManager(
 
             // Apply deployment calibration if present in the profile's thresholds
             applyDeploymentCalibration(profileJson)
+
+            // Apply sensing_config overrides pushed with this profile (PR L3+).
+            // Follows the same SensingConfig.updateFromJson path as sensing_config_update
+            // Socket.IO events so remote-pushable flags (e.g. speech.useLlmExtractor) take
+            // effect without requiring a separate config push event.
+            applySensingConfigOverrides(profileJson)
 
             // Notify listeners (AudienceSensingService will reconfigure)
             synchronized(profileListeners) {
@@ -186,6 +217,27 @@ class SensingProfileManager(
     }
 
     /**
+     * Apply the [sensing_config] sub-object from the profile payload via
+     * [SensingConfig.updateFromJson]. This allows the server to push
+     * section-keyed sensing flags (e.g. `{ speech: { useLlmExtractor: false } }`)
+     * alongside the sensing profile without requiring a separate
+     * `sensing_config_update` Socket.IO event.
+     *
+     * No-ops silently when [sensing_config] is absent or malformed —
+     * the profile apply still succeeds.
+     */
+    private fun applySensingConfigOverrides(profileJson: JSONObject) {
+        val sensingConfigJson = profileJson.optJSONObject("sensing_config") ?: return
+        try {
+            SensingConfig.updateFromJson(sensingConfigJson)
+            Log.i(TAG, "Applied sensing_config overrides from profile: " +
+                sensingConfigJson.keys().asSequence().toList())
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to apply sensing_config overrides from profile: ${e.message}")
+        }
+    }
+
+    /**
      * Parse a SensingProfile from server JSON.
      */
     private fun parseProfile(json: JSONObject): SensingProfile {
@@ -216,6 +268,18 @@ class SensingProfileManager(
         }
         val observationProgram = extractObservationProgramMetadata(json)
 
+        // Capture sensing_config verbatim so we can reapply on cold boot via
+        // loadPersistedProfile() — without this, SensingConfig.updateFromJson
+        // overrides (speech.useLlmExtractor, vlm.* thresholds, engagement
+        // weights, etc.) silently revert to Kotlin defaults on every restart.
+        val sensingConfigJsonString = json.optJSONObject("sensing_config")?.toString()
+
+        // Extract signals[] from program_spec.observation_program.signals.
+        // These are the operator-declared field declarations for both speech and
+        // vision. Persisted verbatim so OnDeviceLlmInsightExtractor can rebuild
+        // its OpenApiTool spec on cold boot without a server round-trip.
+        val signalsJsonString = extractSignalsJson(json)
+
         return SensingProfile(
             profileId = json.optString("profile_id", "unknown"),
             profileName = json.optString("profile_name", "custom"),
@@ -227,25 +291,72 @@ class SensingProfileManager(
             reportIntervalMs = json.optInt("report_interval_ms", 30000),
             vlmPrompt = json.optString("vlm_prompt", "").takeIf { it.isNotBlank() },
             programSpecJson = observationProgram.programSpecJson,
-            programSpecVersion = observationProgram.programSpecVersion
+            programSpecVersion = observationProgram.programSpecVersion,
+            sensingConfigJson = sensingConfigJsonString,
+            signalsJson = signalsJsonString
         )
+    }
+
+    /**
+     * Extract the speech-source field declarations from the push payload JSON.
+     *
+     * PR ρ unified speech + vision declarations onto a single `metrics_schema`
+     * surface (each entry carrying its own `source` discriminator). The
+     * preferred read is `program_spec.output_contract.metrics_schema` filtered
+     * to `source=='speech'`. For back-compat with pre-ρ pushes still in the
+     * fleet's persisted-profile cache, we fall back to the deprecated
+     * `program_spec.observation_program.signals` array.
+     *
+     * Returns the speech entries serialized as a JSON array string so the
+     * value can be persisted verbatim and later parsed by
+     * [SignalsToToolSpecBuilder.parseSignalsArray]. Returns null when no
+     * speech entries are present on either surface.
+     */
+    private fun extractSignalsJson(json: JSONObject): String? {
+        return try {
+            val programSpec = json.optJSONObject("program_spec") ?: return null
+            // Primary surface (PR ρ): metrics_schema filtered to source='speech'.
+            val outputContract = programSpec.optJSONObject("output_contract")
+            val metricsSchema = outputContract?.optJSONArray("metrics_schema")
+            if (metricsSchema != null && metricsSchema.length() > 0) {
+                val speechOnly = JSONArray()
+                for (i in 0 until metricsSchema.length()) {
+                    val entry = metricsSchema.optJSONObject(i) ?: continue
+                    val source = entry.optString("source", "vision")
+                    if (source == "speech") speechOnly.put(entry)
+                }
+                if (speechOnly.length() > 0) return speechOnly.toString()
+            }
+            // Back-compat surface (pre-ρ): observation_program.signals[].
+            // Persisted profiles flashed onto the device before PR ρ rolls
+            // out will still arrive here until the server re-pushes them.
+            val observationProgram = programSpec.optJSONObject("observation_program")
+            val signals = observationProgram?.optJSONArray("signals") ?: return null
+            if (signals.length() == 0) null else signals.toString()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to extract speech signals from profile: ${e.message}")
+            null
+        }
     }
 
     /**
      * Map model IDs to their asset file paths for existence validation.
      * - blazeface: Uses ML Kit (Google Play Services) -- no on-device file needed
      * - age_gender: Requires age_gender_model.tflite (optional, may not be bundled)
-     * - fer_plus: fer_emotion.tflite
      * - movenet: pose_landmarker_lite.task
      * - yamnet: yamnet.tflite
      * - whisper_tiny: moonshine-tiny/ ONNX directory (check tokens.txt as sentinel)
      * - efficientdet: efficientdet_lite0.tflite
      * - yolov8_nano: NO FILE -- not available on device
+     *
+     * NOTE: fer_plus has no dedicated asset path since Phase 3 — its emotion
+     * outputs are produced by FaceLandmarkerProcessor (face_landmarker.task)
+     * alongside gaze + head-pose. The wire-format model_id is retained for
+     * API compatibility; profiles that list it succeed via the no-asset path.
      */
     private fun getModelAssetPath(modelId: String): String? = when (modelId) {
         "blazeface" -> null // ML Kit, no local file
         "age_gender" -> "age_gender_model.tflite"
-        "fer_plus" -> "fer_emotion.tflite"
         "movenet" -> "pose_landmarker_lite.task"
         "yamnet" -> "yamnet.tflite"
         "whisper_tiny" -> "moonshine-tiny/tokens.txt"
@@ -345,7 +456,7 @@ class SensingProfileManager(
                 "efficientdet" -> capabilities.hasCameraHardware
                 "yolov8_nano" -> capabilities.hasCameraHardware
                 // VLM models — require camera for frame capture
-                "gemma_3n_e2b", "gemma_4_e2b", "moondream_05b", "smolvlm_256m" -> capabilities.hasCameraHardware
+                "gemma_4_e2b", "moondream_05b", "smolvlm_256m" -> capabilities.hasCameraHardware
                 else -> {
                     Log.w(TAG, "Unknown model ID: $modelId, skipping")
                     false
@@ -405,6 +516,14 @@ class SensingProfileManager(
                     programSpecJson = profile.programSpecJson,
                     programSpecVersion = profile.programSpecVersion
                 )
+                // Persist sensing_config verbatim so loadPersistedProfile() can
+                // re-apply SensingConfig overrides on cold boot (PR #6386 fix:
+                // useLlmExtractor / shadowLlmExtractor / vlm.* etc. were silently
+                // reverting to Kotlin defaults on every app restart).
+                profile.sensingConfigJson?.let { put("sensing_config", JSONObject(it)) }
+                // Persist signals[] verbatim so OnDeviceLlmInsightExtractor can
+                // rebuild its OpenApiTool spec on cold boot without a server push.
+                profile.signalsJson?.let { put("signals", JSONArray(it)) }
             }
             prefs.edit().putString(KEY_ACTIVE_PROFILE, json.toString()).apply()
             Log.d(TAG, "Persisted profile ${profile.profileId} to SharedPreferences")
@@ -421,11 +540,116 @@ class SensingProfileManager(
         return try {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val json = prefs.getString(KEY_ACTIVE_PROFILE, null) ?: return null
-            val profile = parseProfile(JSONObject(json))
-            Log.i(TAG, "Loaded persisted profile: ${profile.profileName}")
+            val profileJsonObj = JSONObject(json)
+            val profile = parseProfile(profileJsonObj)
+
+            // Re-apply sensing_config overrides on cold boot. Without this every
+            // restart silently reverted SensingConfig overrides (useLlmExtractor,
+            // vlm.* thresholds, engagement weights) to Kotlin defaults — the
+            // device kept the persisted profile metadata but quietly dropped any
+            // feature flag the server had pushed. Verified live on Tab S11
+            // (2026-05-29): after a force-stop the L3-wired LLM extractor never
+            // activated because useLlmExtractor=false on cold boot.
+            //
+            // Idempotency: applySensingConfigOverrides parses the JSONObject and
+            // calls SensingConfig.updateFromJson which merges over current state;
+            // calling twice in a row (once on cold boot, once again when the
+            // server's profile push arrives moments later) is a no-op.
+            applySensingConfigOverrides(profileJsonObj)
+
+            Log.i(TAG, "Loaded persisted profile: ${profile.profileName}" +
+                if (profile.sensingConfigJson != null) " (with sensing_config overrides)" else "")
             profile
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load persisted profile", e)
+            null
+        }
+    }
+
+    /**
+     * PR π (2026-06-01) — Server-first bootstrap.
+     *
+     * Cold-boot ordering FIX: previously [BaseDeviceAgentService.startAudienceSensing]
+     * called [loadPersistedProfile] as the source-of-truth and only got the server's
+     * version via a later WS push (`updateSensingProfile` command). Race condition:
+     *
+     *   1. Operator updates the profile (deploy-profile POST → PG row updated → WS push
+     *      queued via deviceCommandDispatcher with persistent=true).
+     *   2. Device cold-boots and immediately persists + applies the STALE
+     *      "soak_coffee_shop_v1" because the WS push has not arrived yet — or arrives
+     *      but is suppressed by `applyProfile`'s "skip duplicate" gate when the cached
+     *      shape happens to match.
+     *   3. Operator's intent never lands. Verified on Tab S11 (2026-06-01): logcat
+     *      showed `Loaded persisted profile: soak_coffee_shop_v1` repeatedly even
+     *      after the operator pushed a different intent.
+     *
+     * Fix: this method runs at startup BEFORE loadPersistedProfile. It hits
+     * `/v2/earner/sensing/profiles/:screenId`, picks the FIRST active profile (the
+     * route returns them ORDER BY updated_at DESC server-side), and applies it via
+     * the standard `applyProfile` path. The same WS push subsystem keeps working
+     * for run-time updates; this is the cold-start authority.
+     *
+     * Fallback semantics:
+     *   * `fetcher` returning a JSONObject — server-authoritative; apply + persist.
+     *     If a persisted profile with a DIFFERENT profile_id was already on disk,
+     *     it is overwritten transparently by applyProfile → persistProfile.
+     *   * `fetcher` returning null (network down, 5xx, screen not found, empty
+     *     active set) — caller's responsibility to fall back to `loadPersistedProfile`.
+     *     Returning null here signals "use the persisted recovery path".
+     *
+     * The `fetcher` signature is intentionally minimal (suspend (screenId) -> JSONObject?)
+     * so SensingProfileManager doesn't take an ApiClient dependency — the agent-core
+     * module already owns ApiClient elsewhere, and decoupling here keeps unit tests
+     * trivial (Kotlin lambda mock, no okhttp).
+     */
+    suspend fun fetchAndApplyServerProfile(
+        screenId: String,
+        capabilities: DeviceCapabilities,
+        fetcher: suspend (String) -> JSONObject?
+    ): ApplyResult? {
+        if (screenId.isBlank()) {
+            Log.d(TAG, "fetchAndApplyServerProfile skipped: screenId blank")
+            return null
+        }
+        val serverProfile = try {
+            fetcher(screenId)
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAndApplyServerProfile network error: ${e.message}")
+            null
+        }
+        if (serverProfile == null) {
+            Log.i(TAG, "Server profile fetch returned null for screen=$screenId — caller should fall back to persisted")
+            return null
+        }
+
+        // PR π — invalidate persisted cache when the server's profile_id differs
+        // from what's on disk. The applyProfile() path below would do this anyway
+        // (persistProfile overwrites), but the explicit log marker lets us
+        // diagnose stale-cache cases from logcat without inspecting prefs.
+        val persistedId = loadPersistedProfileIdOnly()
+        val serverId = serverProfile.optString("profile_id", "")
+        if (!persistedId.isNullOrEmpty() && serverId.isNotEmpty() && persistedId != serverId) {
+            Log.w(TAG, "Persisted profile cache stale (persisted=$persistedId, server=$serverId) — overwriting")
+        }
+
+        val applyResult = applyProfile(serverProfile, capabilities)
+        if (!applyResult.success) {
+            Log.w(TAG, "applyProfile failed in fetchAndApplyServerProfile: ${applyResult.error}")
+        }
+        return applyResult
+    }
+
+    /**
+     * Read just the persisted profile's profile_id (cheap parse for stale-cache
+     * detection in [fetchAndApplyServerProfile]). Returns null when nothing was
+     * persisted or when the JSON cannot be parsed.
+     */
+    fun loadPersistedProfileIdOnly(): String? {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val json = prefs.getString(KEY_ACTIVE_PROFILE, null) ?: return null
+            JSONObject(json).optString("profile_id", "").ifEmpty { null }
+        } catch (e: Exception) {
             null
         }
     }
