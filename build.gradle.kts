@@ -292,7 +292,7 @@ dependencies {
     implementation("androidx.media3:media3-database:1.5.1")
 
     // IMA Extension (VAST ad insertion via Google IMA SDK)
-    implementation("androidx.media3:media3-exoplayer-ima:1.5.1")
+    compileOnly("androidx.media3:media3-exoplayer-ima:1.5.1")
 
     // Coil (image loading for native image carousels — replaces WebView <img>)
     implementation("io.coil-kt:coil:2.5.0")
@@ -301,7 +301,7 @@ dependencies {
     implementation("com.google.android.gms:play-services-ads-identifier:18.0.1")
 
     // Google Mobile Ads SDK Lite (WebView API for Ads — registerWebView, no ad serving)
-    implementation("com.google.android.gms:play-services-ads-lite:23.6.0")
+    compileOnly("com.google.android.gms:play-services-ads-lite:23.6.0")
 
     // Firebase Installation ID — survives reinstalls, used for cross-install device identity.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))

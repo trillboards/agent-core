@@ -9,6 +9,9 @@ import com.trillboards.ctv.core.audience.AudienceSensingService
 import com.trillboards.ctv.core.audience.SensingConfig as AudienceSensingConfig
 import com.trillboards.ctv.core.net.ApiClient
 import com.trillboards.ctv.core.socket.AgentSocketManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
@@ -93,7 +96,13 @@ object TrillboardsSensingSdk {
             }
 
             val appContext = context.applicationContext
-            val fingerprint = DeviceIdentity.stableFingerprint(appContext, SDK_PREFS_NAME)
+            // Identity: a partner who pre-registered this device via POST /v1/partner/device
+            // passes the SAME stable identifier here as `config.deviceId` (mirrors
+            // MeasurementConfig.deviceId in the CTV Measurement SDK). The backend keys the
+            // device->screen binding off this fingerprint, so it MUST match what was registered.
+            // When unset, fall back to the hardware-derived fingerprint.
+            val fingerprint = config.deviceId?.takeIf { it.isNotBlank() }
+                ?: DeviceIdentity.stableFingerprint(appContext, SDK_PREFS_NAME)
 
             Log.i(TAG, "Starting TrillboardsSensingSdk (fingerprint=${fingerprint.take(12)}…)")
 
@@ -156,6 +165,29 @@ object TrillboardsSensingSdk {
             }
 
             audienceSensing = sensing
+
+            // Resolve this device's screen binding the SAME way the first-party agent does
+            // (BaseDeviceAgentService.resolveScreenId): GET /v2/earner/check-screen/<fingerprint>
+            // returns the screenId for a device the partner already registered+bound via
+            // POST /v1/partner/device. Without a screenId, audience-analyze emits unattributed
+            // (screen_mongo_id=null) — this is what binds sensing to the partner's screen so
+            // Moments/chips show in the Venue portal. Reuses ApiClient.fetchScreenResolution +
+            // AudienceSensingService.setScreenId — no new endpoint, no parallel provisioning.
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    val resolved = client.fetchScreenResolution(fingerprint)
+                    if (resolved != null) {
+                        sensing.setScreenId(resolved.screenId)
+                        resolved.venueType?.takeIf { it.isNotBlank() }?.let { sensing.setVenueType(it) }
+                        Log.i(TAG, "Resolved screen binding: screenId=${resolved.screenId}, venueType=${resolved.venueType}")
+                    } else {
+                        Log.w(TAG, "No screen bound to fingerprint yet — register this device via " +
+                            "POST /v1/partner/device (external_id = your config.deviceId). Sensing runs " +
+                            "but emits unattributed until the binding exists.")
+                    }
+                }.onFailure { Log.w(TAG, "Screen resolution failed", it) }
+            }
+
             started = true
 
             Log.i(TAG, "TrillboardsSensingSdk started successfully")
@@ -240,6 +272,18 @@ object TrillboardsSensingSdk {
             // own ad-serving control plane (Sections 1–11); ignore here.
             Log.d(TAG, "Ignoring device command in sensing-only SDK: ${payload.optString("command_type")}")
         }
+
+        override fun onScreenBinding(payload: JSONObject) {
+            // The backend pushes `screen_binding` when a device is paired to a screen
+            // (e.g. the partner registers the device AFTER the SDK is already running).
+            // Pick up the screenId live so sensing attributes without an app restart —
+            // same handling as BaseDeviceAgentService.handleScreenBinding.
+            val sid = payload.optString("screenId", "").ifEmpty { payload.optString("screen_id", "") }
+            if (sid.isNotEmpty()) {
+                Log.i(TAG, "Screen binding pushed: screenId=$sid")
+                audienceSensing?.setScreenId(sid)
+            }
+        }
     }
 }
 
@@ -275,5 +319,16 @@ data class SensingSdkConfig(
      * realtime emits queue locally and are dropped if the socket isn't
      * connected.
      */
-    val connectSocket: Boolean = true
+    val connectSocket: Boolean = true,
+    /**
+     * Stable per-device identifier that ties this install to a screen in the
+     * Trillboards Venue portal. Pass the SAME value you used as `external_id`
+     * when you registered the device via `POST /v1/partner/device` (mirrors
+     * `MeasurementConfig.deviceId` in the CTV Measurement SDK). The backend keys
+     * the device->screen binding off this, so sensing / Moments / custom chips
+     * attribute to the right screen. When null, the SDK uses a hardware-derived
+     * fingerprint (sensing still runs, but won't attribute until the device is
+     * registered+bound).
+     */
+    val deviceId: String? = null
 )
