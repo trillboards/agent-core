@@ -56,6 +56,7 @@ TrillboardsSensingSdk.start(
 (start the service from a visible Activity per the Android 14 while-in-use rule):
 
 ```kotlin
+import android.os.Build
 import androidx.lifecycle.LifecycleService
 import com.trillboards.sdk.SensingSdkConfig
 import com.trillboards.sdk.TrillboardsSensingSdk
@@ -63,10 +64,12 @@ import com.trillboards.sdk.TrillboardsSensingSdk
 class CaptureService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
-        startForeground(
-            NOTIF_ID, notification,
-            FOREGROUND_SERVICE_TYPE_CAMERA or FOREGROUND_SERVICE_TYPE_MICROPHONE,
-        )
+        val fgsType = FOREGROUND_SERVICE_TYPE_CAMERA or FOREGROUND_SERVICE_TYPE_MICROPHONE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {   // typed startForeground is API 29+
+            startForeground(NOTIF_ID, notification, fgsType)
+        } else {
+            startForeground(NOTIF_ID, notification)              // type comes from the manifest on API 26-28
+        }
         TrillboardsSensingSdk.start(
             context = applicationContext,
             partnerApiKey = "YOUR_PARTNER_API_KEY",
