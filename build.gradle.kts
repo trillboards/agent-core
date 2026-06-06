@@ -137,6 +137,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.8.2")
     // appcompat for AlertDialog (kiosk PIN + Settings dialogs in BaseAgentActivity).
     implementation("androidx.appcompat:appcompat:1.6.1")
+    // lifecycle-common provides LifecycleOwner, exposed in the public SDK surface
+    // (TrillboardsSensingSdk.start(..., lifecycleOwner: LifecycleOwner?), #6655) — `api`
+    // so consumers get it transitively. Mirrors agent-core build.gradle.kts.
+    api("androidx.lifecycle:lifecycle-common:2.6.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
     // Networking
