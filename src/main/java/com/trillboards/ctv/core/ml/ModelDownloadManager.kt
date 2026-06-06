@@ -348,27 +348,50 @@ class ModelDownloadManager(
      */
     fun isModelAvailable(modelId: String): Boolean {
         val modelDir = File(modelsDir, modelId)
-        if (!modelDir.exists()) return false
-        // Check all supported extensions
-        return modelDir.listFiles()?.any {
-            it.isFile && it.length() > 0 && (
-                it.name == MODEL_FILENAME ||
-                it.name.endsWith(".litertlm") ||
-                it.name.endsWith(".onnx")
-            )
-        } == true
+        if (modelDir.exists()) {
+            val hasCached = modelDir.listFiles()?.any {
+                it.isFile && it.length() > 0 && (
+                    it.name == MODEL_FILENAME ||
+                    it.name.endsWith(".litertlm") ||
+                    it.name.endsWith(".onnx")
+                )
+            } == true
+            if (hasCached) return true
+        }
+        // Fall back to APK-bundled asset: callers consider an asset-resident
+        // model "available" because getModelPath() will transparently extract
+        // it on demand (one-time disk copy on first launch).
+        return assetBundledModelName(modelId) != null
     }
 
     /**
-     * Get the filesystem path to a downloaded model binary.
+     * Get the filesystem path to a model binary, extracting it from the APK
+     * `assets/models/<modelId>/` directory if needed.
+     *
+     * Resolution order:
+     *   1. Cached file under cacheDir/models/<modelId>/ (from a prior download
+     *      or a prior asset-extract).
+     *   2. APK-bundled asset at assets/models/<modelId>/<file>.litertlm — when
+     *      present, the asset is one-time-copied to the cache dir on first
+     *      call and the cached path is returned. This eliminates the OTA
+     *      cold-start path for models that are small enough to ship in-APK
+     *      (currently FunctionGemma 270M, ~285 MB).
+     *   3. null when neither path produces a binary.
      *
      * @param modelId Model identifier
-     * @return File pointing to the model binary, or null if not downloaded
+     * @return File pointing to the model binary, or null if neither cache nor
+     *         asset contains it
      */
     fun getModelPath(modelId: String): File? {
+        val cached = cachedModelFile(modelId)
+        if (cached != null) return cached
+        return extractAssetBundledModel(modelId)
+    }
+
+    /** Cache-only resolution; null when nothing has been downloaded/extracted. */
+    private fun cachedModelFile(modelId: String): File? {
         val modelDir = File(modelsDir, modelId)
         if (!modelDir.exists()) return null
-        // Find the model file with any supported extension
         return modelDir.listFiles()?.firstOrNull {
             it.isFile && it.length() > 0 &&
                 // Exclude companion files (mmproj) — they're not the main model
@@ -377,6 +400,126 @@ class ModelDownloadManager(
                 it.name.endsWith(".litertlm") ||
                 it.name.endsWith(".onnx")
             )
+        }
+    }
+
+    /**
+     * Returns the asset filename (under assets/models/<modelId>/) for a
+     * model bundled in the APK, or null when no asset exists for the id.
+     * Uses AssetManager.list() so the lookup survives any future renames
+     * of the bundled file as long as the directory + extension are stable.
+     */
+    private fun assetBundledModelName(modelId: String): String? {
+        return try {
+            val assets = context.assets.list("models/$modelId").orEmpty()
+            assets.firstOrNull { name ->
+                !name.startsWith("mmproj") && (
+                    name.endsWith(".litertlm") ||
+                    name.endsWith(".onnx") ||
+                    name == MODEL_FILENAME
+                )
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Copy the APK-bundled model asset into the cache dir on first use.
+     * No-op when the asset doesn't exist; returns the cached File once the
+     * copy completes (or immediately when a cached copy already exists).
+     *
+     * IMPORTANT: uses [AssetManager.openFd] instead of [AssetManager.open]
+     * for the read. Empirically (Tab S11, AGP 8.5.2, AAPT2 packing the
+     * .litertlm asset as Method=Stored), `assets.open() + copyTo()` for the
+     * 285 MB FunctionGemma 270M file returned only 190 MB — a known Android
+     * AssetManager truncation when the underlying AssetInputStream spans
+     * large STORED entries. `openFd()` gives us an [AssetFileDescriptor]
+     * with explicit `startOffset` + `declaredLength`, so we can read the
+     * exact byte range from the underlying [FileDescriptor] via a positioned
+     * read loop and verify the size against the declared length. This sidesteps
+     * the streaming bug. `openFd()` only works for STORED assets — which is
+     * exactly what `noCompress += "litertlm"` in build.gradle.kts ensures
+     * (verified via `unzip -lv app-debug.apk` → "Method=Stored, 0% compression").
+     */
+    private fun extractAssetBundledModel(modelId: String): File? {
+        val assetName = assetBundledModelName(modelId) ?: return null
+        val modelDir = File(modelsDir, modelId).apply { mkdirs() }
+        val target = File(modelDir, assetName)
+        val assetPath = "models/$modelId/$assetName"
+        // Expected (declared) asset size, resolved up front. Reuse a cached copy
+        // ONLY when it is byte-complete: an extraction interrupted by an app kill or
+        // a full disk leaves a non-zero but TRUNCATED file, which the old
+        // `length() > 0` check happily reused — leaving loadModel permanently broken
+        // (bundled FunctionGemma unavailable) until the cache was cleared.
+        val expectedLength = try {
+            context.assets.openFd(assetPath).use { it.declaredLength }
+        } catch (e: Exception) {
+            Log.w(TAG, "APK-bundled model asset $assetPath not present: ${e.message}")
+            return null
+        }
+        if (target.exists() && target.length() == expectedLength) return target
+        if (target.exists()) {
+            Log.w(TAG, "Cached bundled model $target is ${target.length()}B, expected " +
+                "${expectedLength}B (truncated) — re-extracting")
+            target.delete()
+        }
+        // Extract to a temp file then atomically rename, so a kill mid-copy never
+        // leaves a partial file at `target` for the next launch to reuse.
+        val tmp = File(modelDir, "$assetName.partial")
+        tmp.delete()
+        return try {
+            context.assets.openFd(assetPath).use { afd ->
+                val declaredLength = afd.declaredLength
+                val startOffset = afd.startOffset
+                FileInputStream(afd.fileDescriptor).use { input ->
+                    // Skip past any preceding asset(s) in the same FD. The FD
+                    // is shared across all assets in the same .arsc/.apk
+                    // segment; startOffset positions us at our entry.
+                    var skipped = 0L
+                    while (skipped < startOffset) {
+                        val n = input.skip(startOffset - skipped)
+                        if (n <= 0) throw java.io.IOException(
+                            "Could not skip to asset start: skipped=$skipped target=$startOffset"
+                        )
+                        skipped += n
+                    }
+                    FileOutputStream(tmp).use { output ->
+                        val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                        var remaining = declaredLength
+                        while (remaining > 0) {
+                            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                            val read = input.read(buffer, 0, toRead)
+                            if (read <= 0) {
+                                throw java.io.IOException(
+                                    "Premature EOF extracting asset $assetPath: " +
+                                        "read ${declaredLength - remaining} of $declaredLength bytes"
+                                )
+                            }
+                            output.write(buffer, 0, read)
+                            remaining -= read
+                        }
+                    }
+                }
+            }
+            if (tmp.length() != expectedLength) {
+                throw java.io.IOException(
+                    "Extracted ${tmp.length()}B, expected ${expectedLength}B for $assetPath"
+                )
+            }
+            if (!tmp.renameTo(target)) {
+                throw java.io.IOException("Could not rename $tmp → $target")
+            }
+            val actual = target.length()
+            Log.i(TAG, "Extracted APK-bundled model $modelId → $target " +
+                "(${actual / (1024 * 1024)} MB)")
+            target
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract APK-bundled model $modelId: ${e.message}", e)
+            // Clean up the partial temp so a retry isn't blocked by a stub file.
+            // `target` is only ever created via atomic rename of a verified temp.
+            tmp.delete()
+            null
         }
     }
 

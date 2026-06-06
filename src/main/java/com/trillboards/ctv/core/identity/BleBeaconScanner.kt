@@ -466,10 +466,16 @@ object BleBeaconScanner {
             // OEM builds even when BLUETOOTH_SCAN is fine. Caller falls
             // through to 'unknown'.
             null
-        } catch (e: Exception) {
-            // IllegalStateException / IllegalArgumentException etc — addressType
-            // can throw "cannot be resolved" when the device hasn't been
-            // fully advertised.
+        } catch (e: Throwable) {
+            // Throwable (not Exception): a build that BLOCKS the hidden
+            // BluetoothDevice.getAddressType() API throws NoSuchMethodError —
+            // a LinkageError/Error, NOT an Exception — so it slipped past the
+            // old `catch (Exception)` and crashed the scan (observed on Amlogic
+            // Android 14 TV-box builds: "Accessing hidden method
+            // ...getAddressType()I (blocked, linking, denied)"). Also covers
+            // IllegalState/IllegalArgument when the device isn't fully
+            // advertised. addr_type is optional telemetry — fall through to null.
+            Log.d(TAG, "addressType unavailable (${e.javaClass.simpleName}) — treating as unknown")
             null
         }
     }

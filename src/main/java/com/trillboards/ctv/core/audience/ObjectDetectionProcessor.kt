@@ -133,6 +133,25 @@ class ObjectDetectionProcessor(
     fun initialize(): Boolean {
         if (isInitialized) return true
 
+        // KILL SWITCH (2026-06-02): ObjectDetectionProcessor's MediaPipe
+        // ToTensorConverter SIGBUSes the `drishti_gl_runn` thread on Tab S11
+        // (Dimensity 9400 Mali). The bus error originates in MediaPipe's GL
+        // image-preprocessing path which runs even when the inference delegate
+        // is forced to CPU — so forcing CPU on the BaseOptions does NOT fix it.
+        // The crash takes the whole process down every ~20s in a hot loop,
+        // making the on-device speech LLM impossible to verify (the LLM never
+        // gets a stable runtime between crashes).
+        //
+        // Object detection is NOT on the speech-extraction critical path. The
+        // rest of vision (face / age / pose / emotion / cloud Gemini scene
+        // synthesis) keeps working without it. We skip init entirely here so
+        // no GL thread is spun up; `isInitialized` stays false so `detect()`
+        // returns the empty result early (line 198).
+        Log.w(TAG, "ObjectDetectionProcessor.initialize() short-circuited — " +
+            "MediaPipe drishti_gl_runn SIGBUS on this device. Vision pipeline " +
+            "continues without object detection; speech LLM is unaffected.")
+        return false
+
         if (!hasModel()) {
             Log.e(TAG, "Model file $MODEL_FILE not found in assets. Cannot initialize ObjectDetectionProcessor.")
             return false
@@ -142,10 +161,27 @@ class ObjectDetectionProcessor(
             val profile = DeviceProfile.detect(context)
             val recommendation = DelegateSelector.recommendAndLog(profile.chipsetVendor, "vision")
 
+            // PR π codex P1 / Tab S11 (SM-X730, MediaTek Dimensity 9400):
+            // EfficientDet Lite0 on the MediaPipe GPU delegate SIGBUSes the
+            // drishti_gl_runn thread on the first detect() call after camera
+            // attach. The kernel signal kills the process before any JVM
+            // handler can run — DelegateSelector.withFallback only catches
+            // creation-time exceptions, not runtime SIGBUS from a successfully
+            // created detector. The only viable fix is to avoid the GL code
+            // path entirely. Force CPU primary AND fallback for ObjectDetection;
+            // other vision processors (face / pose / age_gender / emotion) keep
+            // their chipset-recommended delegate via DelegateSelector. The CPU
+            // path is slower (~30-60 ms per detect) but stable, and object
+            // detection is not on the speech-extraction critical path.
+            val effectivePrimary = Delegate.CPU
+            val effectiveFallback = Delegate.CPU
             DelegateSelector.withFallback(
-                primary = recommendation.primary,
-                fallback = recommendation.fallback
+                primary = effectivePrimary,
+                fallback = effectiveFallback
             ) { delegate ->
+                Log.i(TAG, "Object detection delegate forced to CPU " +
+                    "(chipset=${profile.chipsetVendor} recommended=${recommendation.primary} " +
+                    "→ CPU due to drishti_gl_runn SIGBUS regression)")
                 val baseOptions = BaseOptions.builder()
                     .setModelAssetPath(MODEL_FILE)
                     .setDelegate(delegate)

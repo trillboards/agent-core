@@ -29,10 +29,18 @@ import java.util.concurrent.atomic.AtomicLong
  * Manages frame capture for Gemini Vision demographics analysis.
  *
  * Features:
- * - Captures frames only when faces are detected
- * - Rate-limited to max 1 capture per 5 minutes
- * - Compresses to 640x480 JPEG for cost optimization
- * - Sends base64-encoded frames to API for Gemini analysis
+ * - Two capture triggers — NOT face-gated:
+ *     • face-triggered: fires from [onFacesDetected], rate-limited to at most one
+ *       capture per `SensingConfig.capture.minCaptureIntervalMs` (default 30s).
+ *     • periodic scene baseline: the [periodicCaptureRunnable] fires every
+ *       `SensingConfig.capture.periodicIntervalMs` (default 5 min) with NO face
+ *       required, so empty/quiet scenes still report a scene observation.
+ *   Net cadence: ~every 30s while a face is present, ~every 5 min when none is.
+ *   Both share the `minCaptureIntervalMs` rate floor. All intervals are
+ *   config-driven (SensingConfig.capture) and remotely tunable via a
+ *   sensing_config_update push — they are NOT hard-coded magic numbers.
+ * - Compresses to a JPEG (config maxImageWidth/Height) for cost optimization
+ * - Sends base64-encoded frames to /v2/earner/audience-analyze for cloud analysis
  * - Privacy-preserving: frames are processed and discarded immediately
  *
  * IMPORTANT: This class does NOT manage camera binding. The ImageCapture use case
@@ -50,7 +58,10 @@ import java.util.concurrent.atomic.AtomicLong
 class FrameCaptureManager(
     private val context: Context,
     private val apiBaseUrl: String,
-    private val fingerprint: String,
+    // Mutable so the SDK can adopt the canonical device fingerprint resolved by
+    // check-screen (setFingerprint) — a one-time startup update used by the
+    // /v2/earner/audience-analyze POST below; reference assignment is atomic.
+    private var fingerprint: String,
     private val deviceTokenProvider: () -> String? = { null }
 ) {
     companion object {
@@ -172,6 +183,16 @@ class FrameCaptureManager(
      * Check if frame capture is ready.
      */
     fun isReady(): Boolean = isInitialized.get() && imageCapture != null
+
+    /**
+     * Adopt the canonical device fingerprint (from check-screen) for the
+     * audience-analyze POST. No-op for a blank or unchanged value.
+     */
+    fun setFingerprint(fp: String) {
+        if (fp.isNotBlank() && fp != fingerprint) {
+            fingerprint = fp
+        }
+    }
 
     /**
      * Set the screen ID for API calls.

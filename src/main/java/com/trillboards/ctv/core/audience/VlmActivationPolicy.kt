@@ -42,6 +42,20 @@ internal data class VlmActivationDecision(
  */
 internal object VlmActivationPolicy {
 
+    /**
+     * Models that are small enough to ALWAYS load — the protective gating in
+     * this policy is sized for the 2.58 GB Gemma 4 E2B case and is wildly
+     * over-conservative for tiny 270M models. FunctionGemma 270M is 288 MB
+     * declared (~216 MB runtime), comfortably fits alongside the baseline
+     * agent footprint on every device tier we ship to, and replaces 1110 LOC
+     * of hard-coded regex (PR δ). Gating it on a 1024 MB native-heap ceiling
+     * (sized for the big VLM case) blocks it indefinitely on flagship devices
+     * because the agent's steady-state native heap already exceeds 1 GB
+     * (Camera + MediaPipe + Moonshine ASR + WebView). The model is bundled in
+     * the APK via assets/models/, so there is no OTA cold-start either.
+     */
+    private val ALWAYS_ALLOWED_MODELS: Set<String> = setOf("functiongemma_270m")
+
     fun decide(input: VlmActivationInput): VlmActivationDecision {
         val cfg = SensingConfig.get().vlm.activation
 
@@ -52,6 +66,20 @@ internal object VlmActivationPolicy {
         // on Galaxy Tab S11. cfg.liteRtRuntimeMultiplier = 0.75 adds 0.11 safety margin.
         val estimatedRuntimeFootprintMb = ceil(modelSizeMb * cfg.liteRtRuntimeMultiplier).toInt()
         val requiredAvailableRamMb = estimatedRuntimeFootprintMb + cfg.minAvailableHeadroomMb
+
+        // Small models (FunctionGemma 270M) skip the entire gate — see
+        // ALWAYS_ALLOWED_MODELS rationale. The gate exists to protect the
+        // large-VLM case (Gemma 4 E2B) from stacking onto a hot native heap
+        // and tripping LMK; it does not apply when the model footprint is
+        // small enough that LMK isn't a real risk.
+        if (input.modelId in ALWAYS_ALLOWED_MODELS) {
+            return VlmActivationDecision(
+                allowed = true,
+                reason = "always_allowed_small_model",
+                estimatedRuntimeFootprintMb = estimatedRuntimeFootprintMb,
+                requiredAvailableRamMb = requiredAvailableRamMb
+            )
+        }
 
         if (!input.hasForegroundUi) {
             return blocked("ui_unavailable", estimatedRuntimeFootprintMb, requiredAvailableRamMb)

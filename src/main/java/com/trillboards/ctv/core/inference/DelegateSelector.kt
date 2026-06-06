@@ -1,5 +1,6 @@
 package com.trillboards.ctv.core.inference
 
+import android.os.Build
 import android.util.Log
 import com.google.mediapipe.tasks.core.Delegate
 import com.trillboards.ctv.core.audience.DeviceProfile.ChipsetVendor
@@ -115,13 +116,46 @@ object DelegateSelector {
                 acceleratorType = AcceleratorType.CPU,
                 reason = "MediaTek: audio inference is sequential, CPU is optimal"
             )
-            else -> DelegateRecommendation(
-                primary = Delegate.GPU,
-                fallback = Delegate.CPU,
-                acceleratorType = AcceleratorType.GPU,
-                reason = "MediaTek Mali GPU: GPU delegate for vision; APU access via NNAPI path"
-            )
+            else -> if (isUnstableMediaPipeGpuSoc()) {
+                // mt6991 (Dimensity 9400 / Mali-G720) intermittently SIGSEGVs inside
+                // libmediapipe_tasks_jni.so when two MediaPipe Tasks (FaceLandmarker +
+                // Pose) initialize/run the GPU delegate near-concurrently — a native
+                // EGL/GPU-context race exposed when the zoo-perf pass flipped these two
+                // processors from CPU→GPU. A native fatal signal cannot be caught by the
+                // Kotlin GPU→CPU try/catch fallback below the call site, so the only
+                // reliable guard is to not hand this SoC the GPU delegate for MediaPipe
+                // vision tasks. Other MediaTek Mali GPUs keep GPU. Revisit if MediaPipe
+                // Tasks ships EGL thread-safety for this chipset.
+                DelegateRecommendation(
+                    primary = Delegate.CPU,
+                    fallback = Delegate.CPU,
+                    acceleratorType = AcceleratorType.CPU,
+                    reason = "MediaTek $UNSTABLE_GPU_SOC: concurrent MediaPipe GPU tasks SIGSEGV (native EGL race) — CPU for stability"
+                )
+            } else {
+                DelegateRecommendation(
+                    primary = Delegate.GPU,
+                    fallback = Delegate.CPU,
+                    acceleratorType = AcceleratorType.GPU,
+                    reason = "MediaTek Mali GPU: GPU delegate for vision; APU access via NNAPI path"
+                )
+            }
         }
+    }
+
+    // SoC substring of MediaTek chipsets whose Mali GPU driver races on concurrent
+    // MediaPipe Tasks GPU init (native SIGSEGV in libmediapipe_tasks_jni.so). Matched
+    // case-insensitively against Build.SOC_MODEL (API 31+) and Build.HARDWARE.
+    private const val UNSTABLE_GPU_SOC = "mt6991"
+
+    private fun isUnstableMediaPipeGpuSoc(): Boolean {
+        val soc = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else null)
+            ?.lowercase()
+            .orEmpty()
+        // Build.HARDWARE is declared @NonNull but is null under JVM unit tests (no Android
+        // runtime) and can be empty on some devices — guard like Build.SOC_MODEL above.
+        val hardware = (Build.HARDWARE as String?)?.lowercase().orEmpty()
+        return soc.contains(UNSTABLE_GPU_SOC) || hardware.contains(UNSTABLE_GPU_SOC)
     }
 
     /**

@@ -214,6 +214,49 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
             val contentTextClass = Class.forName(CLASS_CONTENT_TEXT)
             val contentsClass = Class.forName(CLASS_CONTENTS)
 
+            // CRITICAL (2026-06-02): enable constrained decoding GLOBALLY.
+            //
+            // litert-lm v0.12 reads `ExperimentalFlags.enableConversationConstrainedDecoding`
+            // (default FALSE — see ExperimentalFlags.kt:54) at conversation-create time
+            // and passes it through `Engine.createConversation` → `nativeCreateConversation`
+            // → `ConversationConfig::Builder().SetEnableConstrainedDecoding(...)` in the
+            // C++ JNI (jni/litertlm.cc:967).
+            //
+            // When this is false the C++ side does NOT enforce the function-call grammar
+            // on the model's output — FunctionGemma is free to emit ANY text and, lacking
+            // a system instruction to anchor it, defaults to refusals like
+            // "I apologize, but I cannot assist..." (observed verbatim on Tab S11 for 4+
+            // hours of testing). The CPP docs spell it out:
+            //   "To enable constrained decoding for tool calling, enable it in the
+            //    ConversationConfig. When the model generates function calls, the
+            //    function call string is constrained to follow the function-calling
+            //    syntax of the model." — docs/api/cpp/constrained-decoding.md
+            //
+            // We set the flag via reflection because the SDK is `runtimeOnly` (compiled
+            // with Kotlin 2.3+/Java 21; project uses 1.9.24/Java 17 so `implementation`
+            // breaks kapt — see agent-core/build.gradle.kts:218 comment). Same reason
+            // every other SDK touch in this file is reflective.
+            //
+            // The flag is read once per Conversation creation; setting it here once per
+            // process is sufficient because OnDeviceLlmInsightExtractor lives for the
+            // lifetime of the agent service.
+            try {
+                val experimentalFlagsClass = Class.forName("com.google.ai.edge.litertlm.ExperimentalFlags")
+                val instanceField = experimentalFlagsClass.getDeclaredField("INSTANCE")
+                    .apply { isAccessible = true }
+                val instance = instanceField.get(null)
+                val setter = experimentalFlagsClass.getDeclaredMethod(
+                    "setEnableConversationConstrainedDecoding",
+                    Boolean::class.javaPrimitiveType
+                ).apply { isAccessible = true }
+                setter.invoke(instance, true)
+                Log.i(TAG, "ExperimentalFlags.enableConversationConstrainedDecoding = true " +
+                    "(constrains FunctionGemma output to the registered tool schema)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to set ExperimentalFlags.enableConversationConstrainedDecoding=true. " +
+                    "Tool calls will NOT be constrained and model may refuse.", e)
+            }
+
             // Create backend: try GPU first, fall back to CPU
             val backend = if (config.useGpu) {
                 try {
@@ -343,22 +386,41 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 }
             }
 
-            // Create system instruction: Contents.of(Content.Text("..."))
-            // Use configurable system prompt (from VLMConfig.systemPrompt) or the default
+            // Create system instruction: Contents.of(String).
+            //
+            // CRITICAL (2026-06-02): the LiteRT-LM SDK declares `Contents.of(...)` as a
+            // Kotlin companion-object method, so in JVM bytecode it lives on
+            // `Contents$Companion`, NOT on `Contents` itself. The previous reflection
+            // looked at `contentsClass.methods.first { ... }` which always threw
+            // `Array contains no element matching the predicate` — `Contents.class`
+            // exposes ZERO `of(...)` methods because they're all on the Companion.
+            // That swallow-and-null meant `ConversationConfig.systemInstruction = null`,
+            // so the engine never emitted the `Message(Role.SYSTEM, ...)` that
+            // FunctionGemma needs to activate its function-calling mode
+            // (cf. gemma-cookbook/docs/functiongemma/full-function-calling-sequence:
+            // "ESSENTIAL SYSTEM PROMPT: This line activates the model's function
+            // calling logic"). Without that activation the model falls back to
+            // plain-text refusals like "I apologize, but I cannot assist…".
+            //
+            // The fix: pull the Companion via `getDeclaredField("Companion").get(null)`,
+            // then invoke `of(String)` on it. The 1-arg `of(text: String)` overload
+            // wraps the text as `Content.Text` internally, so we skip the manual
+            // `Content.Text(...)` construction + the varargs Content[] dance.
             val systemPromptText = config.systemPrompt ?: DEFAULT_SYSTEM_PROMPT
-            val systemText = contentTextClass.getDeclaredConstructor(String::class.java)
-                .newInstance(systemPromptText)
-            // Use varargs-compatible invocation for Contents.of(Content...)
             val systemInstruction = try {
-                val ofMethod = contentsClass.methods.first { m ->
-                    m.name == "of" && m.parameterTypes.isNotEmpty()
-                }
-                val contentArray = java.lang.reflect.Array.newInstance(contentClass, 1)
-                java.lang.reflect.Array.set(contentArray, 0, systemText)
-                ofMethod.invoke(null, contentArray)
+                val contentsCompanion = contentsClass
+                    .getDeclaredField("Companion")
+                    .apply { isAccessible = true }
+                    .get(null)
+                val ofString = contentsCompanion.javaClass.getMethod("of", String::class.java)
+                ofString.invoke(contentsCompanion, systemPromptText)
             } catch (e: Exception) {
-                Log.w(TAG, "Could not create system instruction via Contents.of: ${e.message}")
+                Log.w(TAG, "Could not create system instruction via Contents.Companion.of(String): ${e.message}", e)
                 null
+            }
+            if (systemInstruction != null) {
+                Log.i(TAG, "System instruction wired (${systemPromptText.length} chars) — " +
+                    "FunctionGemma function-calling mode will activate")
             }
 
             // Optionally build an OpenApiTool for constrained function-calling.
@@ -375,32 +437,60 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 true // default — preserve existing behaviour
             }
 
-            // Create ConversationConfig
+            // Create ConversationConfig.
+            //
+            // CRITICAL (2026-06-02): the previous reflection swapped positional args
+            // #3 and #4. The actual Kotlin signature from
+            // litert-lm Config.kt:113 is:
+            //   ConversationConfig(
+            //     systemInstruction: Contents? = null,         // #1
+            //     initialMessages: List<Message> = listOf(),   // #2
+            //     tools: List<ToolProvider> = listOf(),        // #3
+            //     samplerConfig: SamplerConfig? = null,        // #4
+            //     automaticToolCalling: Boolean = true,        // #5
+            //     channels: List<Channel>? = null,
+            //     extraContext: Map<String, Any> = emptyMap(),
+            //     loraConfig: LoraConfig? = null,
+            //   )
+            // The prior code passed `(Contents, List, SamplerConfig, List, Boolean)`
+            // — the JVM has no constructor with that order, so
+            // `getDeclaredConstructor(...)` threw `NoSuchMethodException`,
+            // we fell through to the no-arg constructor below, and ALL params
+            // defaulted: systemInstruction=null, tools=[]. The native
+            // `JsonPreface.messages` was empty (jni/litertlm.cc:938) and
+            // `JsonPreface.tools` was empty (jni/litertlm.cc:949). FunctionGemma
+            // had nothing to constrain against and refused.
+            //
+            // Use the primitive boolean class for `automaticToolCalling` —
+            // `Boolean::class.java` gives the boxed wrapper which does NOT match
+            // the Kotlin compiler's emitted primitive type.
             val convConfig = if (systemInstruction != null) {
                 try {
-                    // Try full constructor: (systemInstruction, initialMessages, samplerConfig, tools, automaticToolCalling)
-                    // Simpler: find a constructor that takes Contents + SamplerConfig
-                    conversationConfigClass.constructors.firstOrNull { ctor ->
-                        ctor.parameterCount >= 2
-                    }?.let { ctor ->
-                        // Use named-parameter-style reflection for Kotlin data class
-                        // ConversationConfig(systemInstruction=..., samplerConfig=..., tools=..., automaticToolCalling=...)
-                        conversationConfigClass.getDeclaredConstructor(
-                            systemInstruction.javaClass,  // systemInstruction: Contents?
-                            List::class.java,              // initialMessages: List<Message>?
-                            samplerConfigClass,            // samplerConfig: SamplerConfig?
-                            List::class.java,              // tools: List<Tool>?
-                            Boolean::class.java            // automaticToolCalling: Boolean
-                        ).newInstance(systemInstruction, null, samplerConfig, toolsList, automaticToolCalling)
-                    } ?: run {
-                        // Fallback: just SamplerConfig
-                        conversationConfigClass.getDeclaredConstructor(samplerConfigClass)
-                            .newInstance(samplerConfig)
+                    // Match the 5-arg @JvmOverloads constructor exactly:
+                    // (Contents, List<Message>, List<ToolProvider>, SamplerConfig, boolean)
+                    val ctor = conversationConfigClass.getDeclaredConstructor(
+                        contentsClass,                       // #1 systemInstruction: Contents?
+                        List::class.java,                    // #2 initialMessages: List<Message>
+                        List::class.java,                    // #3 tools: List<ToolProvider>
+                        samplerConfigClass,                  // #4 samplerConfig: SamplerConfig?
+                        Boolean::class.javaPrimitiveType     // #5 automaticToolCalling: boolean
+                    )
+                    ctor.newInstance(
+                        systemInstruction,                   // #1
+                        emptyList<Any>(),                    // #2 — default initialMessages
+                        toolsList ?: emptyList<Any>(),       // #3 — tools (was #4 in prior bug)
+                        samplerConfig,                       // #4 — samplerConfig (was #3 in prior bug)
+                        automaticToolCalling                 // #5
+                    ).also {
+                        Log.i(TAG, "ConversationConfig built — systemInstruction=set, " +
+                            "tools=${(toolsList?.size ?: 0)}, automaticToolCalling=$automaticToolCalling")
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Full ConversationConfig construction failed: ${e.message}")
+                    Log.e(TAG, "Full ConversationConfig construction failed: ${e.message}", e)
                     try {
-                        conversationConfigClass.getDeclaredConstructor().newInstance()
+                        conversationConfigClass.getDeclaredConstructor().newInstance().also {
+                            Log.w(TAG, "Fell back to no-arg ConversationConfig — systemInstruction + tools are DEFAULTS")
+                        }
                     } catch (e2: Exception) {
                         Log.w(TAG, "Default ConversationConfig also failed: ${e2.message}")
                         null
@@ -481,13 +571,18 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
             // is called only if automaticToolCalling=true (we set false in
             // OnDeviceLlmInsightExtractor so the raw tool-call JSON arrives in the
             // response text for our own parser).
-            val descriptionJson = """
-                {
-                  "name": "EmitSpeechInsights",
-                  "description": "Emit structured speech insights extracted from a retail conversation transcript.",
-                  "parameters": $schemaJson
-                }
-            """.trimIndent()
+            // CRITICAL (2026-06-02): pass schemaJson DIRECTLY — do not wrap.
+            // `SignalsToToolSpecBuilder.build()` already returns a complete tool
+            // descriptor `{ name, description, parameters: { type: object, properties, required } }`.
+            // The previous code re-wrapped it as `{ name, description, parameters: <whole tool> }`,
+            // which produced `parameters: { name, description, parameters }` — corrupt
+            // for the native constrained-decoder. FunctionGemma then emitted the
+            // function name with empty arguments because the parameter-grammar
+            // couldn't be parsed. Mirrors the cloud pattern where
+            // `unifiedSceneSchema.buildDynamicJsonSchema(signals)` produces the
+            // exact JSON Schema Vertex's `responseJsonSchema` consumes — no
+            // double-wrap on either side.
+            val descriptionJson = schemaJson
             val proxy = java.lang.reflect.Proxy.newProxyInstance(
                 toolClass.classLoader,
                 arrayOf(toolClass)
@@ -602,7 +697,7 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
         val startMs = SystemClock.elapsedRealtime()
 
         return try {
-            Log.d(TAG, "VLM generate start: image=${image != null}, promptChars=${prompt.length}")
+            Log.d(TAG, "LM generate start: image=${image != null}, promptChars=${prompt.length}")
             val rawOutput = runBlockingInference {
                 if (image != null) {
                     generateMultiModal(prompt, image)
@@ -624,18 +719,18 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 parsedFields = parseResult.fields
             )
 
-            Log.d(TAG, "VLM inference complete: latency=${latencyMs}ms, " +
+            Log.d(TAG, "LM inference complete: latency=${latencyMs}ms, " +
                 "tokens~${response.tokensGenerated}, parseSuccess=${parseResult.success}, " +
                 "strategy=${parseResult.strategy}, fields=${parseResult.fields.size}")
 
             response
         } catch (e: CancellationException) {
             val latencyMs = SystemClock.elapsedRealtime() - startMs
-            Log.w(TAG, "VLM inference cancelled after ${latencyMs}ms")
+            Log.w(TAG, "LM inference cancelled after ${latencyMs}ms")
             throw e
         } catch (e: Exception) {
             val latencyMs = SystemClock.elapsedRealtime() - startMs
-            Log.e(TAG, "VLM inference failed after ${latencyMs}ms: ${e.message}", e)
+            Log.e(TAG, "LM inference failed after ${latencyMs}ms: ${e.message}", e)
             VLMResponse(
                 text = "",
                 latencyMs = latencyMs,
@@ -703,14 +798,14 @@ class LiteRTLMEngine(private val context: Context) : VLMEngine {
                 // Lists, primitives via org.json's JSONObject(map) ctor.
                 val argsJson = org.json.JSONObject(args).toString()
                 Log.d(TAG, "Tool-call extracted: name=$name, argsKeys=${args.keys}, argsJsonLen=${argsJson.length}")
-                Log.d(TAG, "VLM tool-call response (${argsJson.length} chars): ${argsJson.take(300)}")
+                Log.d(TAG, "LM tool-call response (${argsJson.length} chars): ${argsJson.take(300)}")
                 return argsJson
             }
 
             // Extract text from Message (existing path for non-tool models)
             val getText = message.javaClass.methods.firstOrNull { it.name == "getText" }
             val text = getText?.invoke(message)?.toString() ?: message.toString()
-            Log.d(TAG, "VLM raw response (${text.length} chars): ${text.take(300)}")
+            Log.d(TAG, "LM raw response (${text.length} chars): ${text.take(300)}")
             text
         } catch (e: java.lang.reflect.InvocationTargetException) {
             Log.e(TAG, "Text-only generation threw: ${e.cause?.message}", e.cause)

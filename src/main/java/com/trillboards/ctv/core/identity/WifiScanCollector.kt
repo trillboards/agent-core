@@ -104,8 +104,14 @@ object WifiScanCollector {
                 .getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 ?: return null
 
-            if (!wifiManager.isWifiEnabled) {
-                Log.d(TAG, "WiFi disabled — skipping scan")
+            // Scan-only support (Ethernet-only fleets): WiFi scanning works with the
+            // radio fully enabled OR with Android's "Wi-Fi scanning always available"
+            // (Settings.Global.wifi_scan_always_enabled) on. The latter powers the radio
+            // just enough to enumerate nearby APs WITHOUT joining a network or interfering
+            // with an active Ethernet link, so a device kept off WiFi for connectivity can
+            // still be positioned. startScan()/getScanResults() honor this mode.
+            if (!canScan(wifiManager.isWifiEnabled, isScanAlwaysAvailableSafe(wifiManager))) {
+                Log.d(TAG, "WiFi off and scan-only (scan-always-available) off — skipping scan")
                 return null
             }
 
@@ -154,6 +160,29 @@ object WifiScanCollector {
         } catch (e: Exception) {
             Log.w(TAG, "WiFi scan failed: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Whether a WiFi scan can be attempted. True when the radio is enabled OR when
+     * "Wi-Fi scanning always available" (scan-only mode) is on — the latter lets
+     * startScan()/getScanResults() enumerate nearby APs without the radio joining a
+     * network, so Ethernet-only devices can be positioned without enabling WiFi for
+     * connectivity (which can conflict with a wired link). Pure + internal for testing.
+     */
+    internal fun canScan(wifiEnabled: Boolean, scanAlwaysAvailable: Boolean): Boolean =
+        wifiEnabled || scanAlwaysAvailable
+
+    /**
+     * [WifiManager.isScanAlwaysAvailable] read defensively. Deprecated on API 30+ but
+     * still authoritative for the wifi_scan_always_enabled setting; any throw -> false.
+     */
+    private fun isScanAlwaysAvailableSafe(wifiManager: WifiManager): Boolean {
+        return try {
+            @Suppress("DEPRECATION")
+            wifiManager.isScanAlwaysAvailable
+        } catch (e: Throwable) {
+            false
         }
     }
 

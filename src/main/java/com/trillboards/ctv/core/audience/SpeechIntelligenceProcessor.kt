@@ -16,6 +16,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import com.trillboards.ctv.core.SensingConfig
 import kotlinx.coroutines.Job
@@ -63,7 +64,25 @@ class SpeechIntelligenceProcessor(
      * When non-null AND [SensingConfig.SpeechProcessingConfig.useLlmExtractor] = true
      * AND [OnDeviceLlmInsightExtractor.isLoaded] = true, acts as the PRIMARY analyzer.
      */
-    private val onDeviceLlmExtractor: OnDeviceLlmInsightExtractor? = null
+    private val onDeviceLlmExtractor: OnDeviceLlmInsightExtractor? = null,
+    /**
+     * Supplies the current device token so the /v2/earner/analyze-speech persist
+     * POST is device-authenticated. The server resolves THIS screen's active
+     * Sense Anything profile (and its declared speech schema) from the token —
+     * without it the server falls back to the retail default profile and drops
+     * operator-declared custom fields. Null default keeps existing call-sites
+     * compiling (POST then degrades to the soft-auth retail fallback).
+     */
+    private val deviceTokenProvider: () -> String? = { null },
+    /**
+     * Supplies the current screen id (mongo id) for the /analyze-speech POST
+     * body — mirrors the frame-analyze POST (FrameCaptureManager sends
+     * `screenId`). Sending it triggers the server's screen-binding lookup so
+     * the active profile resolves deterministically (rather than depending on
+     * the token resolution alone). Null default keeps existing call-sites
+     * compiling; the field is simply omitted from the body when null.
+     */
+    private val screenIdProvider: () -> String? = { null }
 ) {
     companion object {
         private const val TAG = "SpeechIntelligence"
@@ -318,19 +337,21 @@ class SpeechIntelligenceProcessor(
             }
         }
 
-        // Initialize OkHttpClient for cloud Gemini fallback
+        // Initialize OkHttpClient for /v2/earner/analyze-speech POSTs — the cloud
+        // path that OWNS speech OFV (transcript → declared fields + IAB chip-cloud,
+        // sent every usable window). Requires a device fingerprint for soft-auth.
         if (fingerprint.isNotEmpty()) {
             try {
                 httpClient = OkHttpClient.Builder()
                     .connectTimeout(10, TimeUnit.SECONDS)
                     .readTimeout(15, TimeUnit.SECONDS)
                     .build()
-                Log.i(TAG, "HttpClient initialized for cloud Gemini fallback")
+                Log.i(TAG, "HttpClient initialized for /analyze-speech (cloud OFV owner)")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize HttpClient", e)
             }
         } else {
-            Log.w(TAG, "No fingerprint provided - cloud Gemini fallback disabled")
+            Log.w(TAG, "No fingerprint provided - cloud /analyze-speech disabled (no speech OFV)")
         }
     }
 
@@ -345,10 +366,10 @@ class SpeechIntelligenceProcessor(
             val requestJson = JSONObject().apply {
                 put("transcript", transcript)
                 put("fingerprint", fingerprint)
+                screenIdProvider()?.takeIf { it.isNotBlank() }?.let { put("screenId", it) }
             }
 
-            val request = Request.Builder()
-                .url("$apiBaseUrl/v2/earner/analyze-speech")
+            val request = authedRequestBuilder("$apiBaseUrl/v2/earner/analyze-speech")
                 .post(requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
@@ -440,12 +461,32 @@ class SpeechIntelligenceProcessor(
     }
 
     /**
+     * Device-authenticated request builder for /v2/earner/analyze-speech POSTs.
+     * Mirrors [com.trillboards.ctv.core.net.ApiClient]'s auth helper: the
+     * X-Device-Token lets the server resolve THIS screen's active Sense Anything
+     * profile (and its declared speech schema) so operator-declared custom fields
+     * (e.g. bartender_tone) validate against the right schema instead of the
+     * soft-auth retail fallback. No token → headers omitted (server soft-auths).
+     */
+    private fun authedRequestBuilder(url: String): Request.Builder {
+        val builder = Request.Builder()
+            .url(url)
+            .header("X-Device-Timestamp", System.currentTimeMillis().toString())
+            .header("X-Device-Nonce", UUID.randomUUID().toString())
+        deviceTokenProvider().orEmpty().trim().takeIf { it.isNotEmpty() }?.let { token ->
+            builder.header("X-Device-Token", token)
+            builder.header("X-Trillboard-Device-Token", token)
+        }
+        return builder
+    }
+
+    /**
      * Process the current audio buffer:
      * 1. Get audio samples and check for meaningful audio
      * 2. Transcribe with Moonshine ASR
-     * 3. Classify via LLM PRIMARY → cloud Gemini → empty SpeechInsights
-     * 4. IMMEDIATELY delete transcript
-     * 5. Emit structured insights
+     * 3. On-device LLM → a confident result drives the socket live-panes
+     * 4. Send EVERY usable transcript to the cloud (/analyze-speech) — cloud owns OFV
+     * 5. IMMEDIATELY delete the transcript
      */
     private suspend fun processAudioChunk() {
         // Get audio samples from buffer
@@ -490,24 +531,38 @@ class SpeechIntelligenceProcessor(
 
             Log.d(TAG, "Moonshine transcription length: ${transcript.length} chars")
 
-            // Classify: LLM PRIMARY → cloud Gemini → empty
+            // Classify: the on-device LLM drives the real-time socket panes.
             val insights = analyzeWithHybridRace(transcript)
 
-            // Check confidence threshold
-            if (insights.confidence < config.minConfidenceThreshold) {
-                Log.d(TAG, "Low confidence (${insights.confidence}), skipping emission")
-                return
+            // Socket live-panes only (audienceSignals persists nothing since the
+            // 2026-05-07 L9 cut). Emit above the confidence floor — don't push
+            // silence/noise to the UI. This path NO LONGER writes OFV; the cloud
+            // owns OFV (below).
+            if (insights.confidence >= config.minConfidenceThreshold) {
+                _currentInsights.value = insights
+                onInsightsReady?.invoke(insights)
+                Log.i(TAG, "Speech insights emitted (socket): " +
+                    "profileFields=${insights.profileFields.keys}, " +
+                    "source=${insights.classificationSource}, " +
+                    "confidence=${insights.confidence}")
+            } else {
+                Log.d(TAG, "Low confidence (${insights.confidence}) — socket emit skipped")
             }
 
-            // Update state and emit
-            _currentInsights.value = insights
-            onInsightsReady?.invoke(insights)
-
-            Log.i(TAG, "Speech insights emitted: " +
-                "brands=${insights.brandMentions.size}, " +
-                "stage=${insights.purchaseJourney.stage}, " +
-                "sentiment=${insights.sentimentTone}, " +
-                "confidence=${insights.confidence}")
+            // Cloud OWNS the OFV (speech → IAB chip-cloud, like vision): send EVERY
+            // usable transcript to /v2/earner/analyze-speech. The cloud Gemini
+            // extracts the operator's declared speech fields AND the IAB chip-cloud
+            // (iab_at_1_1 + brands_in_speech) and persists them server-side via the
+            // SAME structured-output machinery vision uses (provenance cloud_speech
+            // + cloud_synthesis). The on-device LLM stays the real-time socket
+            // analyzer above; it no longer writes OFV. Capture the transcript into a
+            // val before the finally zeroes it; fire-and-forget off the audio thread.
+            val transcriptForCloud = transcript
+            if (!transcriptForCloud.isNullOrBlank()) {
+                processorScope.launch(Dispatchers.IO) {
+                    analyzeWithGeminiServer(transcriptForCloud)
+                }
+            }
 
         } finally {
             // CRITICAL: Immediately zero out transcript memory
@@ -518,57 +573,67 @@ class SpeechIntelligenceProcessor(
     }
 
     /**
-     * Speech classification: LLM PRIMARY → cloud Gemini → empty (PR δ).
+     * Speech classification for the REAL-TIME SOCKET panes: the on-device LLM is
+     * the analyzer.
      *
-     * Priority order:
-     *   0. **PRIMARY:** [OnDeviceLlmInsightExtractor] when
-     *      [SensingConfig.SpeechProcessingConfig.useLlmExtractor] = true AND
-     *      [OnDeviceLlmInsightExtractor.isLoaded] = true. A non-null return is used
-     *      immediately; path 1 is skipped. Null (timeout/parse failure) falls through.
-     *   1. **FALLBACK:** cloud Gemini via /v2/earner/analyze-speech.
-     *   Both fail → emit [SpeechInsights](confidence=0f); server discards low-confidence.
+     * The [OnDeviceLlmInsightExtractor] (FunctionGemma 270M) runs when loaded and
+     * emits the operator-declared fields into [SpeechInsights.profileFields] (the
+     * Sense-Anything contract); [processAudioChunk] forwards a confident result to
+     * [onInsightsReady] (the live socket panes). If the LLM is loaded but returns
+     * null (timeout / parse failure / no declared field survived coercion), the
+     * transcript is DROPPED for the socket — emit [SpeechInsights](confidence=0f).
+     * No regex zoo.
      *
-     * No regex fallback. Privacy: transcript is sent to server only in path 1.
+     * This path NO LONGER writes OFV. The cloud OWNS OFV: [processAudioChunk] sends
+     * EVERY usable transcript to [analyzeWithGeminiServer] (/v2/earner/analyze-speech),
+     * which extracts the operator's declared fields AND the IAB chip-cloud
+     * (iab_at_1_1 + brands_in_speech) and persists them server-side (provenance
+     * cloud_speech + cloud_synthesis) — the same structured-output machinery vision
+     * uses. Privacy: the transcript crosses the wire to the cloud (like vision's
+     * frame) but is never persisted on-device.
      *
      * Visibility: `internal` so unit tests in the same module can call directly.
      */
     @Suppress("VisibleForTests")
     internal suspend fun analyzeWithHybridRace(transcript: String): SpeechInsights {
-        // ── PATH 0: PRIMARY on-device LLM (SSM-gated, default OFF) ─────────
-        val speechCfg = SensingConfig.get().speech
-        if (speechCfg.useLlmExtractor && onDeviceLlmExtractor?.isLoaded() == true) {
-            val startMs = System.currentTimeMillis()
-            try {
-                val llmInsights = onDeviceLlmExtractor.analyze(transcript)
-                if (llmInsights != null) {
-                    Log.i(TAG, "PRIMARY LLM result used (${System.currentTimeMillis() - startMs}ms, " +
-                        "source=${llmInsights.classificationSource}, " +
-                        "brands=${llmInsights.brandMentions.size}, " +
-                        "stage=${llmInsights.purchaseJourney.stage})")
-                    return llmInsights
-                }
-                Log.d(TAG, "PRIMARY LLM returned null (${System.currentTimeMillis() - startMs}ms) " +
-                    "— falling through to cloud Gemini")
-            } catch (e: Exception) {
-                Log.e(TAG, "PRIMARY LLM threw unexpectedly — falling through to cloud Gemini", e)
-            }
+        // L9 single-path speech (2026-06-02): the on-device LLM is the SOLE
+        // analyzer. No cloud Gemini "regex zoo" fallback — if the LLM is not
+        // loaded or returns null, the transcript is dropped (confidence=0f).
+        // The operator deploys a Sense Anything profile with declared speech
+        // signals; the device's OnDeviceLlmInsightExtractor loads with that
+        // schema and emits structured outputs that fan out to OFV exactly
+        // like vision does. ASR → LLM → structured outputs → OFV. Period.
+        val extractor = onDeviceLlmExtractor
+        if (extractor == null || !extractor.isLoaded()) {
+            // On-device LLM unavailable (e.g. a 32-bit box where LiteRT-LM has no
+            // armeabi-v7a .so and can't load). Return confidence=0 so the caller
+            // [processAudioChunk] routes the transcript to the cloud fallback
+            // (analyzeWithGeminiServer -> POST /v2/earner/analyze-speech), which
+            // extracts intent/brands/products server-side and persists OFV
+            // (provenance='cloud_speech'). NOTE: prior log said "no cloud fallback"
+            // — that was wrong; the fallback fires in the caller (gated on
+            // llmUnavailable). The screen's Sense Anything profile must declare the
+            // speech signals for the server to emit those structured fields.
+            Log.i(TAG, "On-device LLM not loaded — routing transcript to cloud fallback (/analyze-speech).")
+            return SpeechInsights(confidence = 0f)
         }
-
-        // ── PATH 1: FALLBACK — cloud Gemini ─────────────────────────────────
-        if (httpClient != null && fingerprint.isNotEmpty()) {
-            val serverResult = withContext(Dispatchers.IO) {
-                runCatching { analyzeWithGeminiServer(transcript) }.getOrNull()
+        val startMs = System.currentTimeMillis()
+        return try {
+            val llmInsights = extractor.analyze(transcript)
+            if (llmInsights == null) {
+                Log.w(TAG, "On-device LLM returned null (${System.currentTimeMillis() - startMs}ms) — " +
+                    "dropping transcript (no cloud fallback)")
+                SpeechInsights(confidence = 0f)
+            } else {
+                Log.i(TAG, "On-device LLM result (${System.currentTimeMillis() - startMs}ms, " +
+                    "source=${llmInsights.classificationSource}, " +
+                    "profileFields=${llmInsights.profileFields.keys})")
+                llmInsights
             }
-            if (serverResult != null && serverResult.isValid()) {
-                Log.d(TAG, "Using cloud Gemini result (${serverResult.latencyMs}ms, " +
-                    "brands=${serverResult.brands.size})")
-                return serverResult.toSpeechInsights()
-            }
+        } catch (e: Exception) {
+            Log.e(TAG, "On-device LLM threw unexpectedly — dropping transcript (no cloud fallback)", e)
+            SpeechInsights(confidence = 0f)
         }
-
-        // Both paths failed — emit empty so the server's low-confidence filter handles it
-        Log.w(TAG, "Both LLM and cloud Gemini failed — emitting empty SpeechInsights(confidence=0f)")
-        return SpeechInsights(confidence = 0f)
     }
 
     /**

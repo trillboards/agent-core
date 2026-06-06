@@ -109,7 +109,10 @@ internal fun criticalMemoryBackstopTier(
  */
 class AudienceSensingService(
     private val context: Context,
-    private val fingerprint: String,
+    // Mutable so the SDK can adopt the canonical device fingerprint returned by
+    // check-screen (setAudienceFingerprint) once the screen binding resolves —
+    // a one-time startup update; reference assignment is atomic.
+    private var fingerprint: String,
     private val socketManager: AgentSocketManager,
     private val apiBaseUrl: String = "https://api.trillboards.com",
     private val deviceTokenProvider: () -> String? = { null }
@@ -591,6 +594,35 @@ class AudienceSensingService(
     }
 
     /**
+     * True only for EXTERNAL (USB) cameras — the one camera type that can be
+     * physically attached or detached at runtime.
+     *
+     * [CameraManager.AvailabilityCallback] reports a built-in camera as
+     * "unavailable" whenever it is merely in use (by our own analyzer, the
+     * demographics capture, or any other process) and "available" again when
+     * released. Treating those in-use transitions as hotplug events drives a storm
+     * of capability re-evaluations, and when one catches a transient camera-query
+     * glitch it triggers a destructive analyzer restart that races in-flight camera
+     * frames. Restricting the hotplug path to external cameras matches its stated
+     * intent (USB hotplug) and removes the spurious-restart root cause.
+     *
+     * Fails OPEN: if the characteristics query throws, the camera is most likely
+     * already gone (a genuine USB removal), so allow re-evaluation to proceed.
+     */
+    private fun isExternalCamera(cameraId: String): Boolean {
+        return try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                ?: return true
+            val facing = cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.LENS_FACING)
+            facing == CameraCharacteristics.LENS_FACING_EXTERNAL || facing == null
+        } catch (e: Exception) {
+            Log.w(TAG, "[Hotplug] Could not read facing for camera $cameraId (likely removed): ${e.message}")
+            true
+        }
+    }
+
+    /**
      * Register callbacks for USB device hotplug detection.
      * Automatically re-evaluates capabilities when USB cameras or microphones are connected/disconnected.
      */
@@ -636,12 +668,22 @@ class AudienceSensingService(
         if (cameraManager != null) {
             cameraAvailabilityCallback = object : CameraManager.AvailabilityCallback() {
                 override fun onCameraAvailable(cameraId: String) {
-                    Log.i(TAG, "[Hotplug] >>> CAMERA AVAILABLE: $cameraId")
+                    // Built-in cameras report "available"/"unavailable" every time they
+                    // go idle/in-use — including when OUR OWN analyzer (or the
+                    // demographics capture) opens and releases them. Those are not
+                    // hotplug events. Only USB/external cameras are physically attached
+                    // or detached at runtime, so ignore internal-camera transitions;
+                    // otherwise our own camera usage drives a storm of capability
+                    // re-evaluations and a transient camera-query glitch tears the
+                    // analyzer down mid-frame (the spurious device-swap crash).
+                    if (!isExternalCamera(cameraId)) return
+                    Log.i(TAG, "[Hotplug] >>> EXTERNAL CAMERA AVAILABLE: $cameraId")
                     onDeviceHotplug(cameraAdded = true, cameraId = cameraId)
                 }
 
                 override fun onCameraUnavailable(cameraId: String) {
-                    Log.i(TAG, "[Hotplug] >>> CAMERA UNAVAILABLE: $cameraId")
+                    if (!isExternalCamera(cameraId)) return
+                    Log.i(TAG, "[Hotplug] >>> EXTERNAL CAMERA UNAVAILABLE: $cameraId")
                     onDeviceHotplug(cameraRemoved = true, cameraId = cameraId)
                 }
             }
@@ -1451,14 +1493,18 @@ class AudienceSensingService(
         // PR L3: the extractor is stored in [onDeviceLlmExtractor] so SpeechIntelligenceProcessor
         // can call it when SensingConfig.speech.useLlmExtractor becomes true (PR L5 SSM flip).
         val downloadManager = com.trillboards.ctv.core.ml.ModelDownloadManager(context)
-        val llmExtractor = OnDeviceLlmInsightExtractor(
+        // Reuse an already-created extractor across config re-applies, hotplug
+        // restarts and sensing upgrades — startSpeechIntelligence() runs on all of
+        // those paths, and recreating the extractor each time would discard the warm
+        // 271MB model and force a cold reload + re-warmup. The schema is kept current
+        // by setActiveSignalsJson → initialize(), which reloads only when the
+        // operator's declared speech fields actually change.
+        val llmExtractor = onDeviceLlmExtractor ?: OnDeviceLlmInsightExtractor(
             context = context,
             modelDownloadManager = downloadManager,
             signalsJsonSupplier = { activeSignalsJson },
             attenuationManager = attenuationManager
-        )
-        // Store extractor as service field so SpeechIntelligenceProcessor receives it below.
-        onDeviceLlmExtractor = llmExtractor
+        ).also { onDeviceLlmExtractor = it }
 
         sensingScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val initialized = llmExtractor.initialize()
@@ -1546,7 +1592,13 @@ class AudienceSensingService(
             config = speechConfig,
             fingerprint = fingerprint,
             apiBaseUrl = apiBaseUrl,
-            onDeviceLlmExtractor = onDeviceLlmExtractor
+            onDeviceLlmExtractor = onDeviceLlmExtractor,
+            // Device-auth the /analyze-speech edge persist POST so the server
+            // resolves THIS screen's declared speech schema (not the retail default).
+            deviceTokenProvider = deviceTokenProvider,
+            // Send screenId in the POST body (mirrors the frame-analyze POST) so the
+            // server's screen-binding lookup resolves the active profile deterministically.
+            screenIdProvider = { screenId }
         ).apply {
             // Wire noise profile from audio classifier for noise-robust preprocessing
             audioClassificationProcessor = audioProcessor
@@ -1561,7 +1613,11 @@ class AudienceSensingService(
                 }
 
                 // Log significant insights immediately
-                if (insights.hasBrandMentions() || insights.hasActionablePurchaseSignals()) {
+                if (insights.profileFields.isNotEmpty()) {
+                    // Sense-Anything on-device LLM path — the operator's declared fields.
+                    Log.i(TAG, "[Speech] >>> PROFILE FIELDS (${insights.classificationSource}): " +
+                            insights.profileFields)
+                } else if (insights.hasBrandMentions() || insights.hasActionablePurchaseSignals()) {
                     Log.i(TAG, "[Speech] >>> ACTIONABLE INSIGHT: " +
                             "brands=${insights.brandMentions}, " +
                             "stage=${insights.purchaseJourney.stage}, " +
@@ -2626,66 +2682,16 @@ class AudienceSensingService(
                 put("csiNodeCount", effectiveCsiNodeCount)
             }
 
-            // Speech insights (structured signals only - no raw text)
-            if (aggregatedSpeech != null) {
-                put("speech", JSONObject().apply {
-                    put("brandMentions", JSONArray(aggregatedSpeech.brandMentions))
-                    put("brandMatches", JSONArray(aggregatedSpeech.brandMatches.map { match ->
-                        JSONObject().apply {
-                            put("canonicalName", match.canonicalName)
-                            put("observedText", match.observedText)
-                            put("confidence", match.confidence.toDouble())
-                            put("matchType", match.matchType)
-                        }
-                    }))
-                    put("productCategories", JSONArray(aggregatedSpeech.productCategories))
-                    put("shoppingContexts", JSONArray(aggregatedSpeech.shoppingContexts))
-                    put("priceInquiry", aggregatedSpeech.priceInquiry)
-                    put("availabilityInquiry", aggregatedSpeech.availabilityInquiry)
-                    // purchaseIntent removed — cloud Gemini emits the
-                    // canonical speech_purchase_intent enum.
-                    put("purchaseJourney", JSONObject().apply {
-                        put("stage", aggregatedSpeech.purchaseJourney.stage)
-                        put("urgency", aggregatedSpeech.purchaseJourney.urgency)
-                        put("journeySignals", JSONArray(aggregatedSpeech.purchaseJourney.journeySignals))
-                        put("evidencePhrases", JSONArray(aggregatedSpeech.purchaseJourney.evidencePhrases))
-                    })
-                    put("mentionedBuyingToday", aggregatedSpeech.mentionedBuyingToday)
-                    put("objections", JSONArray(aggregatedSpeech.objections.map { it.name }))
-                    put("objectionInsights", JSONArray(aggregatedSpeech.objectionInsights.map { objection ->
-                        JSONObject().apply {
-                            put("theme", objection.theme)
-                            put("summaryLabel", objection.summaryLabel)
-                            put("evidencePhrase", objection.evidencePhrase)
-                            put("confidence", objection.confidence.toDouble())
-                        }
-                    }))
-                    put("interests", JSONArray(aggregatedSpeech.interests))
-                    put("sentimentTone", aggregatedSpeech.sentimentTone.name)
-                    put("conversationType", aggregatedSpeech.conversationType.name)
-                    put("estimatedSpeakerCount", aggregatedSpeech.estimatedSpeakerCount)
-                    put("classificationSource", aggregatedSpeech.classificationSource)
-                    put("confidence", aggregatedSpeech.confidence)
-                    aggregatedSpeech.speechSemantics?.let { semantics ->
-                        put("speechSemantics", semantics.toJson())
-                    }
-                })
-
-                put("speechEvidence", JSONObject().apply {
-                    put("classificationSource", aggregatedSpeech.classificationSource)
-                    put("speakerCount", aggregatedSpeech.estimatedSpeakerCount)
-                    put("confidence", aggregatedSpeech.confidence)
-                    put("hasActionableSignals", aggregatedSpeech.hasActionablePurchaseSignals())
-                    put("hasBrandMentions", aggregatedSpeech.hasBrandMentions())
-                    put(
-                        "onScreenCorrelation",
-                        edgeQualityTelemetry.observationFamily == ObservationSignalClassifier.SCREEN_AUDIENCE
-                    )
-                    aggregatedSpeech.speechSemantics?.let { semantics ->
-                        put("speechSemantics", semantics.toJson())
-                    }
-                })
-            }
+            // Speech OFV is the CLOUD's job now (cloud owns speech OFV). The
+            // SpeechIntelligenceProcessor sends EVERY usable transcript to
+            // /v2/earner/analyze-speech, where the server writes the declared
+            // fields + the IAB chip-cloud (provenance cloud_speech +
+            // cloud_synthesis) — the same structured-output machinery vision uses.
+            // Re-emitting a `speech` block on /audience-analyze would double-write
+            // the same utterance under edge_baseline (Codex P2, PR #6622), racing
+            // the OFV PK under ON CONFLICT DO NOTHING and inflating speech counts.
+            // aggregatedSpeech still feeds the live-panes summary + telemetry
+            // counts/logs above; it is intentionally NOT re-persisted here.
 
             // Emotional engagement metrics (pose, emotion, gaze)
             if (emotionalEngagement != null) {
@@ -2988,6 +2994,33 @@ class AudienceSensingService(
             Log.w(TAG, "[ClipTriggers] evaluation failed (non-fatal): ${e.message}")
         }
 
+        // Tee the anonymous aggregate to the host-app callback (partner SDK).
+        // Wrapped + fire-and-forget — a throwing host callback must never break
+        // the emit path or the ~10s aggregation budget. No-op when unset
+        // (first-party agents pay nothing).
+        onSensingResult?.let { cb ->
+            try {
+                cb(SensingResult(
+                    faceCount = avgFaceCount,
+                    personCount = avgPersonCount,
+                    attention = avgAttention,
+                    dwellMs = avgDwellMs,
+                    noiseLevel = avgNoiseTier.takeIf { it >= 0 },
+                    ambientLux = avgAmbientLux.takeIf { it >= 0f },
+                    ambience = dominantAmbience,
+                    adReceptivity = avgAdReceptivity,
+                    dominantEmotion = emotionalEngagement?.emotion?.dominantEmotion?.name,
+                    engagementScore = emotionalEngagement?.overallEngagementScore?.toDouble(),
+                    bodyEngagement = emotionalEngagement?.pose?.bodyEngagementScore?.toDouble(),
+                    speakerCount = aggregatedSpeech?.estimatedSpeakerCount,
+                    brandMentionCount = aggregatedSpeech?.brandMentions?.size,
+                    windowEndEpochMs = System.currentTimeMillis(),
+                ))
+            } catch (e: Exception) {
+                Log.w(TAG, "[SensingResult] host callback threw (non-fatal): ${e.message}")
+            }
+        }
+
         // Emit unified audience signals to backend (with offline buffering)
         if (socketManager.isConnected()) {
             socketManager.emit("audienceSignals", payload)
@@ -3083,6 +3116,20 @@ class AudienceSensingService(
             avgConfidence = avgConfidence
         )
 
+        // Sense-Anything (speech): merge the generic operator-declared fields
+        // TYPE-AWARE (an untyped "latest" would corrupt counters — the flagship
+        // "count how many people asked for X" use case). Carry the dominant
+        // classificationSource forward so the payload builder can detect a
+        // cloud-sourced window and avoid a double OFV write.
+        val mergedProfileFields = mergeProfileFields(snapshots, activeSignalsJson)
+        val dominantClassificationSource = snapshots
+            .map { it.classificationSource }
+            .filter { it.isNotBlank() && it != "unknown" }
+            .groupingBy { it }
+            .eachCount()
+            .maxByOrNull { it.value }
+            ?.key ?: "unknown"
+
         return SpeechInsights(
             brandMentions = allBrands,
             brandMatches = snapshots
@@ -3103,8 +3150,76 @@ class AudienceSensingService(
             conversationType = dominantConversationType,
             estimatedSpeakerCount = maxSpeakers,
             confidence = avgConfidence,
-            speechSemantics = speechSemantics
+            classificationSource = dominantClassificationSource,
+            speechSemantics = speechSemantics,
+            profileFields = mergedProfileFields
         )
+    }
+
+    /**
+     * Merge the generic profile-field maps across the speech snapshots in a
+     * window, TYPE-AWARE. Each declared field reduces per its declared type:
+     *   list                     → union, de-duplicated
+     *   counter                  → sum (per-window counts accumulate)
+     *   gauge                    → mean
+     *   boolean                  → OR (true if any window saw it)
+     *   enum / category / string → mode (dominant value; ties → latest)
+     *   unknown declared type    → latest non-null value
+     * Untyped "latest" would corrupt counters — the whole point of declaring a
+     * counter (e.g. "oat-milk requests this window") is that it accumulates.
+     */
+    private fun mergeProfileFields(
+        snapshots: List<SpeechInsights>,
+        signalsJson: String?
+    ): Map<String, Any> {
+        val withFields = snapshots.filter { it.profileFields.isNotEmpty() }
+        if (withFields.isEmpty()) return emptyMap()
+
+        val types = parseSpeechFieldTypes(signalsJson)
+        val out = LinkedHashMap<String, Any>()
+        // Preserve first-seen key order across snapshots for stable payloads.
+        val allKeys = LinkedHashSet<String>().apply {
+            withFields.forEach { addAll(it.profileFields.keys) }
+        }
+
+        for (key in allKeys) {
+            val values = withFields.mapNotNull { it.profileFields[key] }
+            if (values.isEmpty()) continue
+            val merged: Any? = when (types[key]) {
+                "list" -> values
+                    .flatMap { v -> (v as? List<*>)?.map { it.toString() } ?: listOf(v.toString()) }
+                    .distinct()
+                "counter" -> values.sumOf { v ->
+                    (v as? Number)?.toInt() ?: v.toString().toIntOrNull() ?: 0
+                }
+                "gauge" -> values
+                    .mapNotNull { v -> (v as? Number)?.toDouble() ?: v.toString().toDoubleOrNull() }
+                    .takeIf { it.isNotEmpty() }
+                    ?.average()
+                "boolean" -> values.any { v -> (v as? Boolean) ?: v.toString().toBoolean() }
+                // enum / category / string → mode (dominant value); tie → latest
+                "enum", "category", "string" -> values
+                    .map { it.toString() }
+                    .groupingBy { it }
+                    .eachCount()
+                    .maxByOrNull { it.value }
+                    ?.key
+                // unknown declared type → latest non-null value
+                else -> values.last()
+            }
+            if (merged != null && !(merged is List<*> && merged.isEmpty())) {
+                out[key] = merged
+            }
+        }
+        return out
+    }
+
+    /** Parse the active profile's signals JSON into field → declared type (speech only). */
+    private fun parseSpeechFieldTypes(signalsJson: String?): Map<String, String> {
+        if (signalsJson.isNullOrBlank()) return emptyMap()
+        return SignalsToToolSpecBuilder.parseSignalsArray(signalsJson)
+            .filter { it.source == "speech" }
+            .associate { it.field to it.type }
     }
 
     private fun mergeSpeechSemantics(
@@ -3389,6 +3504,30 @@ class AudienceSensingService(
     }
 
     /**
+     * Adopt the canonical device fingerprint resolved by check-screen. A partner
+     * SDK initially identifies by its external_id (config.deviceId); once the
+     * backend resolves the real binding it calls this so audience-analyze +
+     * audienceSignals carry the canonical finger_print and attribute in both
+     * soft- and strict-enforce modes. One-time startup update; no-op for a blank
+     * or unchanged value (e.g. first-party agents already on their hardware fp).
+     */
+    fun setAudienceFingerprint(fp: String) {
+        if (fp.isBlank() || fp == fingerprint) return
+        fingerprint = fp
+        frameCaptureManager?.setFingerprint(fp)
+        Log.i(TAG, "Audience fingerprint adopted: ${fp.take(12)}…")
+    }
+
+    /**
+     * Optional host-app callback, invoked once per aggregation window (~10s)
+     * with the anonymous [SensingResult] for that window. Wired by the partner
+     * SDK facade from `SensingSdkConfig.onSensingResult`; null for first-party
+     * agents (zero overhead when unset). Never blocks the emit path.
+     */
+    @Volatile
+    var onSensingResult: ((SensingResult) -> Unit)? = null
+
+    /**
      * Set the venue ID for this screen's venue.
      * Called by DeviceAgentService when venue assignment is resolved from the API.
      */
@@ -3514,9 +3653,42 @@ class AudienceSensingService(
     }
 
     /** Set the signals[] JSON array from the active profile's program_spec.observation_program.
-     *  Used by [OnDeviceLlmInsightExtractor] to build its OpenApiTool spec at runtime. */
+     *  Used by [OnDeviceLlmInsightExtractor] to build its OpenApiTool spec at runtime.
+     *
+     *  L9 single-path speech (2026-06-02): the LLM extractor must re-attempt
+     *  initialization whenever fresh signals arrive — the eager init at
+     *  service start fires BEFORE the server profile fetch completes (race),
+     *  so without this retry the LLM stays dormant forever and every speech
+     *  window emits empty SpeechInsights(confidence=0f). [OnDeviceLlmInsightExtractor.initialize]
+     *  is idempotent (no-op when `loaded`), so re-firing on every profile
+     *  apply is safe. */
     fun setActiveSignalsJson(signalsJson: String?) {
+        val previous = activeSignalsJson
         activeSignalsJson = signalsJson
+        // Trigger (re)init whenever the signals materially change. initialize() is
+        // mutex-guarded and schema-aware: it no-ops when the speech schema is
+        // unchanged (heartbeat re-applies of the same profile), initialises when the
+        // engine isn't loaded yet (startup race), and RELOADS with the new tool spec
+        // when the operator's declared speech fields change — so a freshly-deployed
+        // profile takes effect live, without a device restart.
+        val changed = previous != signalsJson
+        val extractor = onDeviceLlmExtractor
+        if (changed && signalsJson != null && extractor != null) {
+            Log.i(TAG, "[Speech] activeSignalsJson changed — (re)initializing OnDeviceLlmInsightExtractor")
+            sensingScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val initialized = extractor.initialize()
+                    if (initialized) {
+                        Log.i(TAG, "[Speech] OnDeviceLlmInsightExtractor ready after signals update")
+                    } else {
+                        Log.w(TAG, "[Speech] OnDeviceLlmInsightExtractor.initialize() returned false after signals update " +
+                            "— extractor logs above explain why")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "[Speech] OnDeviceLlmInsightExtractor.initialize() threw after signals update", e)
+                }
+            }
+        }
     }
 
     /** Preserve observation-program metadata for downstream payload compatibility. */

@@ -43,7 +43,19 @@ data class SpeechInsights(
     val confidence: Float = 0f,
 
     // Canonical speech semantics for cross-platform "Sense Anything" contracts
-    val speechSemantics: SpeechSemantics? = null
+    val speechSemantics: SpeechSemantics? = null,
+
+    /**
+     * Generic operator-declared speech fields produced by the on-device LLM
+     * extractor (Sense Anything for speech). Keys are the active profile's
+     * snake_case metrics_schema field names; values are type-coerced scalars /
+     * lists (Int / Double / Boolean / String / List<String>). This is the
+     * carrier that flows to `speech.profile_fields` on the wire and fans out to
+     * typed OFV rows with provenance='edge_speech_llm' — exactly like vision
+     * custom fields. Empty for the legacy retail / cloud-Gemini paths (which
+     * still populate the named retail fields above).
+     */
+    val profileFields: Map<String, Any> = emptyMap()
 ) {
     /**
      * Check if this contains any actionable purchase signals.
@@ -150,10 +162,14 @@ data class ObjectionInsight(
  * Sentiment detected from conversation tone
  */
 enum class SentimentTone {
-    NEGATIVE,   // Frustration, disappointment, anger
-    NEUTRAL,    // Normal conversation
+    NEGATIVE,   // Unhappy, frustrated
+    NEUTRAL,    // Factual, no clear emotion
     POSITIVE,   // Happy, satisfied
-    EXCITED     // High energy, enthusiasm
+    MIXED       // Both positive and negative cues (canonical SENTIMENT_TONE_ENUM, #6585)
+    // NOTE: keep in lockstep with audienceTypedSignals.SENTIMENT_TONE_ENUM
+    // [POSITIVE,NEUTRAL,NEGATIVE,MIXED]. Emotional intensity (excitement, stress)
+    // is NOT a sentiment value — it lives in dedicated fields (excitement_level,
+    // departure_urgency). Legacy EXCITED/STRESSED fold into the parsers below.
 }
 
 /**

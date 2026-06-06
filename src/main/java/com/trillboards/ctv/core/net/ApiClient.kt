@@ -33,7 +33,10 @@ class ApiClient(
     data class ScreenResolution(
         val screenId: String,
         val venueType: String?,
-        val deviceToken: String?
+        val deviceToken: String?,
+        // Canonical device fingerprint (check-screen `data.fingerprint`). The SDK
+        // adopts it for audience-analyze so attribution holds in strict-enforce.
+        val fingerprint: String? = null
     )
 
     private fun currentDeviceToken(): String? =
@@ -80,10 +83,12 @@ class ApiClient(
                 val screenId = data.optString("_id", "") .ifEmpty { data.optString("screenId", "") }.ifEmpty { return@use null }
                 val venueType = data.optString("venue_type", "").ifEmpty { null }
                 val deviceToken = data.optString("device_token", "").ifEmpty { null }
+                val canonicalFingerprint = data.optString("fingerprint", "").ifEmpty { null }
                 ScreenResolution(
                     screenId = screenId,
                     venueType = venueType,
-                    deviceToken = deviceToken
+                    deviceToken = deviceToken,
+                    fingerprint = canonicalFingerprint
                 )
             }
         }.onFailure { Log.w(TAG, "fetchScreenResolution failed", it) }.getOrNull()
@@ -118,6 +123,22 @@ class ApiClient(
                 )
             }
         }.onFailure { Log.w(TAG, "sendHeartbeat failed", it) }.getOrNull()
+    }
+
+    /**
+     * Partner heartbeat — marks the device online and sets `lastHeartbeatAt`
+     * via the partner REST endpoint, keyed by the partner's external_id (the
+     * same value used as `config.deviceId`) or fingerprint. Distinct from the
+     * first-party socket [sendHeartbeat] above. Driven by the opt-in
+     * `SensingSdkConfig.heartbeatEnabled` timer. Returns true on a 2xx.
+     */
+    suspend fun sendPartnerHeartbeat(deviceId: String): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val request = authRequestBuilder("${config.apiBaseUrl}/v1/partner/device/$deviceId/heartbeat")
+                .post("{}".toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            client.newCall(request).execute().use { response -> response.isSuccessful }
+        }.onFailure { Log.w(TAG, "sendPartnerHeartbeat failed", it) }.getOrDefault(false)
     }
 
     /**
